@@ -19,7 +19,9 @@ use crate::interactive;
 use crate::linter::Linter;
 use crate::logging::{ColorChoice, Logger};
 use crate::parser::{ParseMode, Parser as MarkfileParser};
-use crate::project::{AnalysisMode, ProjectAnalyzer};
+use crate::project::{
+    AnalysisMode, ProjectAnalyzer, config_directory, find_root_file,
+};
 
 // 定义 mkd 的命令行参数。
 #[derive(Debug, Parser)]
@@ -113,12 +115,24 @@ enum Command {
         )]
         check: bool,
     },
-    #[command(about = "Initialize main.mf, mkd.toml, and a Git repository")]
+    #[command(about = "Initialize a Markfile project (hidden .mkd/ by default)")]
     Init {
         #[arg(value_name = "DIRECTORY")]
         directory: Option<PathBuf>,
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "lib",
+            help = "Create a flat project with main.mf beside mkd.toml"
+        )]
+        flat: bool,
+        #[arg(
+            long,
+            conflicts_with = "flat",
+            help = "Create a flat package project rooted at lib.mf"
+        )]
+        lib: bool,
     },
     #[command(about = "Stage all project changes and commit them with an inferred message")]
     Archive,
@@ -296,7 +310,7 @@ impl fmt::Display for CliError {
             }
             Self::RootNotFound(start) => write!(
                 formatter,
-                "no main.mf found in `{}` or its parents; use --root to specify a root Markfile",
+                "no project root found in `{}` or its parents; expected main.mf, lib.mf, .mkd/main.mf, or .mkd/lib.mf; use --root to specify a root Markfile",
                 start.display()
             ),
             Self::RootIsDirectory(path) => {
@@ -412,13 +426,20 @@ fn execute(
 ) -> Result<(), CliError> {
     let started = Instant::now();
     match cli.command {
-        Command::Init { directory, target } => {
+        Command::Init { directory, target, flat, lib } => {
             if cli.root.is_some() {
                 return Err(CliError::Init("--root cannot be used with init".into()));
             }
             execute_init(
                 directory.as_deref(),
                 target.as_deref(),
+                if lib {
+                    InitLayout::Lib
+                } else if flat {
+                    InitLayout::Flat
+                } else {
+                    InitLayout::Hidden
+                },
                 current_directory,
                 logger,
                 started,
@@ -426,8 +447,28 @@ fn execute(
         }
         Command::Archive => {
             let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
-            let project_directory = root_file.parent().unwrap_or_else(|| Path::new("."));
-            let message = archive_project(project_directory).map_err(CliError::Archive)?;
+            let config_dir = config_directory(&root_file);
+            let hidden = root_file
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == std::ffi::OsStr::new(".mkd"));
+            let scopes: Vec<String> = if hidden {
+                [".mkd", "mkd.toml", "mkd.lock"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .filter(|scope| config_dir.join(scope).exists())
+                    .collect()
+            } else {
+                vec![".".to_owned()]
+            };
+            let scopes = scopes.iter().map(String::as_str).collect::<Vec<_>>();
+            let root_relative = if hidden {
+                Path::new(".mkd").join(root_file.file_name().unwrap_or_default())
+            } else {
+                root_file.file_name().map(PathBuf::from).unwrap_or_default()
+            };
+            let message = archive_project(&config_dir, &scopes, &root_relative)
+                .map_err(CliError::Archive)?;
             let subject = message.lines().next().unwrap_or(&message);
             logger
                 .finished(
@@ -455,14 +496,13 @@ fn execute(
                 return Err(CliError::InteractiveTerminalRequired);
             }
             let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
-            let project_directory = root_file.parent().unwrap_or_else(|| Path::new("."));
             let target = target.as_deref().map(parse_target_id).transpose()?;
             let output = output.map(|path| resolve_from(current_directory, &path));
             let image = image.map(|path| {
                 if path.is_absolute() {
                     path
                 } else {
-                    project_directory.join(path)
+                    config_directory(&root_file).join(path)
                 }
             });
             let terminal_allows_color = output.is_none()
@@ -506,10 +546,10 @@ fn execute(
                 ))
             })?;
             let target = profile.target_id().map_err(CliError::Init)?;
-            let project_dir = root_file.parent().unwrap_or_else(|| Path::new("."));
+            let project_dir = config_directory(&root_file);
             let output = match output {
                 Some(path) => resolve_from(current_directory, &path),
-                None => project_path(project_dir, profile.output())
+                None => project_path(&project_dir, profile.output())
                     .map_err(CliError::ProfileUnavailable)?,
             };
             let template_path = if no_template {
@@ -519,7 +559,7 @@ fn execute(
             } else {
                 profile
                     .template()
-                    .map(|path| project_path(project_dir, path))
+                    .map(|path| project_path(&project_dir, path))
                     .transpose()
                     .map_err(CliError::ProfileUnavailable)?
             };
@@ -656,7 +696,7 @@ fn compile_target(
         || project_input_files(root_file, &project)
             .iter()
             .any(|path| paths_alias(&output, path))
-        || paths_alias(&output, &root_file.with_file_name("mkd.toml"))
+        || paths_alias(&output, &config_directory(root_file).join("mkd.toml"))
     {
         return Err(CliError::OutputAliasesInput(output));
     }
@@ -797,17 +837,52 @@ fn prepare_graph_output(path: &Path, root_file: &Path, project: &Project) -> Res
         || project_input_files(root_file, project)
             .iter()
             .any(|input| paths_alias(path, input))
-        || paths_alias(path, &root_file.with_file_name("mkd.toml"))
+        || paths_alias(path, &config_directory(root_file).join("mkd.toml"))
     {
         return Err(CliError::OutputAliasesInput(path.to_path_buf()));
     }
     Ok(())
 }
 
+// 描述 init 创建的项目布局。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitLayout {
+    /// 应用型项目：Markfile 收在 .mkd/ 内，mkd.toml 在外。
+    Hidden,
+    /// 平铺应用型项目：main.mf 与 mkd.toml 同目录。
+    Flat,
+    /// 包型项目：lib.mf 为根，与 mkd.toml 同目录。
+    Lib,
+}
+
+impl InitLayout {
+    // 返回该布局下项目根文件的路径。
+    fn root_file(self, directory: &Path) -> PathBuf {
+        match self {
+            Self::Hidden => directory.join(".mkd").join("main.mf"),
+            Self::Flat => directory.join("main.mf"),
+            Self::Lib => directory.join("lib.mf"),
+        }
+    }
+
+    // 渲染该布局的入口 Markfile 模板。
+    fn markfile_template(self, target: &str) -> String {
+        match self {
+            Self::Lib => format!(
+                "---\n# {target}\n描述包对外提供的能力。\n- 明确一条可核验的验收规格。\n---\n> {target}\n"
+            ),
+            Self::Hidden | Self::Flat => format!(
+                "---\n# {target}\n描述要完成的工作。\n- 明确一条可核验的验收规格。\n---\n> {target}\n"
+            ),
+        }
+    }
+}
+
 // 根据目录中已有文件安全初始化可构建项目。
 fn execute_init(
     directory: Option<&Path>,
     target: Option<&str>,
+    layout: InitLayout,
     current_directory: &Path,
     logger: &mut Logger<impl Write>,
     started: Instant,
@@ -815,7 +890,7 @@ fn execute_init(
     let directory = directory
         .map(|path| resolve_from(current_directory, path))
         .unwrap_or_else(|| current_directory.to_path_buf());
-    let root_file = directory.join("main.mf");
+    let root_file = layout.root_file(&directory);
     let config_file = directory.join("mkd.toml");
     let has_root = root_file.exists();
     let has_config = config_file.exists();
@@ -827,9 +902,10 @@ fn execute_init(
     }
     let target = match (has_root, target) {
         (true, None) => {
-            return Err(CliError::Init(
-                "main.mf already exists; pass --target TARGET to create its build profile".into(),
-            ));
+            return Err(CliError::Init(format!(
+                "`{}` already exists; pass --target TARGET to create its build profile",
+                root_file.display()
+            )));
         }
         (true, Some(name)) => {
             let target = parse_target_id(name)?;
@@ -868,15 +944,13 @@ fn execute_init(
         "version = 1\n\n[build]\ndefault = \"main\"\n\n[build.main]\ntarget = {}\noutput = \"dist/plan.md\"\n",
         toml::Value::String(target.to_string())
     );
-    let markfile = format!(
-        "---\n# {}\n描述要完成的工作。\n- 明确一条可核验的验收规格。\n---\n> {}\n",
-        target.name(),
-        target.name()
-    );
-    fs::create_dir_all(&directory).map_err(|source| CliError::WriteOutput {
-        path: directory.clone(),
-        source,
-    })?;
+    let markfile = layout.markfile_template(target.name());
+    if let Some(parent) = root_file.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::WriteOutput {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
     if !has_root {
         use std::io::Write as _;
         let mut file = fs::OpenOptions::new()
@@ -1104,14 +1178,6 @@ fn resolve_root_file(
     }
     find_root_file(current_directory)
         .ok_or_else(|| CliError::RootNotFound(current_directory.to_owned()))
-}
-
-// 从起始目录向上寻找最近的 main.mf。
-fn find_root_file(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .map(|directory| directory.join("main.mf"))
-        .find(|candidate| candidate.is_file())
 }
 
 // 将命令行目标转换为稳定的绝对逻辑标识。

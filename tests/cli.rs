@@ -281,7 +281,7 @@ fn binary_refuses_to_overwrite_compilation_inputs() {
 fn init_and_named_profiles_build_reproducibly_from_nested_directory() {
     let directory = temporary_directory();
     let project = directory.join("project");
-    let initialized = run(&directory, &["init", "project"]);
+    let initialized = run(&directory, &["init", "--flat", "project"]);
     assert!(initialized.status.success(), "{initialized:?}");
     assert!(project.join(".git").is_dir());
     fs::create_dir_all(project.join("nested")).unwrap();
@@ -313,7 +313,7 @@ fn init_and_named_profiles_build_reproducibly_from_nested_directory() {
 fn archive_commits_all_changes_with_inferred_target_messages() {
     let directory = temporary_directory();
     let project = directory.join("project");
-    let initialized = run(&directory, &["init", "project"]);
+    let initialized = run(&directory, &["init", "--flat", "project"]);
     assert!(initialized.status.success(), "{initialized:?}");
     configure_git_identity(&project);
 
@@ -365,7 +365,7 @@ fn archive_commits_all_changes_with_inferred_target_messages() {
 #[test]
 fn archive_uses_fallback_message_for_non_target_changes() {
     let directory = temporary_directory();
-    let initialized = run(&directory, &["init"]);
+    let initialized = run(&directory, &["init", "--flat"]);
     assert!(initialized.status.success(), "{initialized:?}");
     configure_git_identity(&directory);
     assert!(run(&directory, &["archive"]).status.success());
@@ -528,14 +528,14 @@ fn init_safely_completes_existing_project() {
     let directory = temporary_directory();
     let source = "---\n# publish\n- ready\n---\n> publish\n";
     fs::write(directory.join("main.mf"), source).unwrap();
-    assert!(!run(&directory, &["init"]).status.success());
+    assert!(!run(&directory, &["init", "--flat"]).status.success());
     assert!(
-        !run(&directory, &["init", "--target", "missing"])
+        !run(&directory, &["init", "--flat", "--target", "missing"])
             .status
             .success()
     );
     assert!(!directory.join("mkd.toml").exists());
-    let init = run(&directory, &["init", "--target", "publish"]);
+    let init = run(&directory, &["init", "--flat", "--target", "publish"]);
     assert!(init.status.success(), "{init:?}");
     assert!(run(&directory, &["build"]).status.success());
     assert_eq!(
@@ -543,7 +543,7 @@ fn init_safely_completes_existing_project() {
         source
     );
     assert!(
-        !run(&directory, &["init", "--target", "publish"])
+        !run(&directory, &["init", "--flat", "--target", "publish"])
             .status
             .success()
     );
@@ -882,4 +882,133 @@ fn binary_rejects_legacy_bare_target_and_profile_command() {
         let result = run(&project, arguments);
         assert_eq!(result.status.code(), Some(2), "{result:?}");
     }
+}
+
+// 验证默认 init 创建 .mkd/ 隐藏布局，且 mkd.toml 与产物在配置目录。
+#[test]
+fn init_defaults_to_hidden_layout_with_external_config() {
+    let directory = temporary_directory();
+    let initialized = run(&directory, &["init"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    assert!(directory.join(".mkd/main.mf").is_file());
+    assert!(directory.join("mkd.toml").is_file());
+    assert!(!directory.join("main.mf").exists());
+
+    fs::create_dir_all(directory.join("src/deep")).unwrap();
+    let built = run(&directory.join("src/deep"), &["build"]);
+    assert!(built.status.success(), "{built:?}");
+    assert!(
+        fs::read_to_string(directory.join("dist/plan.md"))
+            .unwrap()
+            .contains("规格实施计划：start")
+    );
+
+    // 配置目录里的产物不会与 .mkd 内的 Markfile 冲突。
+    fs::write(
+        directory.join(".mkd/helper.mf"),
+        "---\n# assist\n- 辅助完成。\n---\n> assist\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.join("src/stray.mf"),
+        "---\n# stray\n- 不应被发现。\n---\n> stray\n",
+    )
+    .unwrap();
+    let graph = run(&directory.join("src"), &["graph"]);
+    assert!(graph.status.success(), "{graph:?}");
+    let graph_text = String::from_utf8(graph.stdout).unwrap();
+    assert!(graph_text.contains("assist"));
+    assert!(!graph_text.contains("stray"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证隐藏布局的归档只提交 Markfile 相关范围。
+#[test]
+fn archive_in_hidden_layout_commits_only_markdown_scope() {
+    let directory = temporary_directory();
+    let initialized = run(&directory, &["init"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    configure_git_identity(&directory);
+
+    fs::create_dir_all(directory.join("src")).unwrap();
+    fs::write(directory.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let first = run(&directory, &["archive"]);
+    assert!(first.status.success(), "{first:?}");
+    let message = git(&directory, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(message.stdout).unwrap().trim(),
+        "Archive targets: add 1\n\nAdd:\n- start"
+    );
+    assert_eq!(
+        String::from_utf8(git(&directory, &["status", "--porcelain"]).stdout)
+            .unwrap()
+            .trim(),
+        "?? src/"
+    );
+
+    fs::write(
+        directory.join(".mkd/main.mf"),
+        "---\n# launch\nShip it.\n- shipped\n---\n> launch\n",
+    )
+    .unwrap();
+    let second = run(&directory, &["archive"]);
+    assert!(second.status.success(), "{second:?}");
+    let message = git(&directory, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(message.stdout).unwrap().trim(),
+        "Archive targets: add 1, remove 1\n\nAdd:\n- launch\n\nRemove:\n- start"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证 --lib 创建以 lib.mf 为根的平铺包项目并可以构建公开目标。
+#[test]
+fn init_lib_creates_flat_package_project() {
+    let directory = temporary_directory();
+    let initialized = run(&directory, &["init", "--lib"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    assert!(directory.join("lib.mf").is_file());
+    assert!(directory.join("mkd.toml").is_file());
+    assert!(!directory.join("main.mf").exists());
+    assert!(!directory.join(".mkd").exists());
+
+    let lib = fs::read_to_string(directory.join("lib.mf")).unwrap();
+    assert!(lib.contains("---\n> start\n"));
+
+    let built = run(&directory, &["build"]);
+    assert!(built.status.success(), "{built:?}");
+    assert!(
+        fs::read_to_string(directory.join("dist/plan.md"))
+            .unwrap()
+            .contains("规格实施计划：start")
+    );
+
+    // lib.mf 作为根不能再被当作 lib 模块导入。
+    fs::write(
+        directory.join("lib.mf"),
+        "> crate::lib::start\n---\n# start\n- ready\n---\n> start\n",
+    )
+    .unwrap();
+    let broken = run(&directory, &["build"]);
+    assert!(!broken.status.success(), "{broken:?}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证同一目录内四种根的优先级与向上搜索。
+#[test]
+fn root_discovery_prefers_documented_order() {
+    let directory = temporary_directory();
+    fs::create_dir_all(directory.join("work")).unwrap();
+    fs::create_dir_all(directory.join(".mkd")).unwrap();
+    fs::write(directory.join(".mkd/main.mf"), "---\n# hidden\n- hidden\n---\n> hidden\n").unwrap();
+    fs::write(directory.join("lib.mf"), "---\n# lib\n- lib\n---\n> lib\n").unwrap();
+    let result = run(&directory.join("work"), &["target", "lib", "--check"]);
+    assert!(result.status.success(), "{result:?}");
+
+    fs::write(directory.join("main.mf"), "---\n# flat\n- flat\n---\n> flat\n").unwrap();
+    let result = run(&directory.join("work"), &["target", "flat", "--check"]);
+    assert!(result.status.success(), "{result:?}");
+    let result = run(&directory.join("work"), &["target", "lib", "--check"]);
+    assert!(!result.status.success(), "{result:?}");
+    fs::remove_dir_all(directory).unwrap();
 }

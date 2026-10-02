@@ -48,73 +48,56 @@ pub fn initialize_repository(directory: &Path) -> Result<(), ArchiveError> {
     require_success("init", output).map(|_| ())
 }
 
-/// 暂存项目中的全部变化，推断 Target 摘要并创建提交。
-pub fn archive_project(directory: &Path) -> Result<String, ArchiveError> {
-    require_success(
-        "add",
-        run_git(
-            directory,
-            [
-                OsStr::new("add"),
-                OsStr::new("--all"),
-                OsStr::new("--"),
-                OsStr::new("."),
-            ],
-        )?,
-    )?;
+/// 暂存指定范围内的全部变化，推断 Target 摘要并创建提交。
+pub fn archive_project(directory: &Path, scopes: &[&str], root_relative: &Path) -> Result<String, ArchiveError> {
+    let mut staged = vec![OsStr::new("add"), OsStr::new("--all"), OsStr::new("--")];
+    staged.extend(scopes.iter().map(OsStr::new));
+    require_success("add", run_git(directory, staged)?)?;
 
-    let changed = run_git(
-        directory,
-        [
-            OsStr::new("diff"),
-            OsStr::new("--cached"),
-            OsStr::new("--quiet"),
-            OsStr::new("--"),
-            OsStr::new("."),
-        ],
-    )?;
+    let mut cached = vec![
+        OsStr::new("diff"),
+        OsStr::new("--cached"),
+        OsStr::new("--quiet"),
+        OsStr::new("--"),
+    ];
+    cached.extend(scopes.iter().map(OsStr::new));
+    let changed = run_git(directory, cached)?;
     match changed.status.code() {
         Some(0) => return Err(ArchiveError::NothingToArchive),
         Some(1) => {}
         _ => return Err(git_failure("diff", &changed)),
     }
 
-    let message = infer_commit_message(directory)?;
-    require_success(
-        "commit",
-        run_git(
-            directory,
-            [
-                OsStr::new("commit"),
-                OsStr::new("--quiet"),
-                OsStr::new("-m"),
-                OsStr::new(&message),
-                OsStr::new("--"),
-                OsStr::new("."),
-            ],
-        )?,
-    )?;
+    let message = infer_commit_message(directory, scopes, root_relative)?;
+    let mut commit = vec![
+        OsStr::new("commit"),
+        OsStr::new("--quiet"),
+        OsStr::new("-m"),
+        OsStr::new(&message),
+        OsStr::new("--"),
+    ];
+    commit.extend(scopes.iter().map(OsStr::new));
+    require_success("commit", run_git(directory, commit)?)?;
     Ok(message)
 }
 
 // 根据暂存区相对 HEAD 的 Markfile 变化生成确定性摘要。
-fn infer_commit_message(directory: &Path) -> Result<String, ArchiveError> {
-    let output = require_success(
-        "diff",
-        run_git(
-            directory,
-            [
-                OsStr::new("diff"),
-                OsStr::new("--cached"),
-                OsStr::new("--name-status"),
-                OsStr::new("-z"),
-                OsStr::new("--no-renames"),
-                OsStr::new("--relative"),
-                OsStr::new("--"),
-                OsStr::new("."),
-            ],
-        )?,
-    )?;
+fn infer_commit_message(
+    directory: &Path,
+    scopes: &[&str],
+    root_relative: &Path,
+) -> Result<String, ArchiveError> {
+    let mut diff = vec![
+        OsStr::new("diff"),
+        OsStr::new("--cached"),
+        OsStr::new("--name-status"),
+        OsStr::new("-z"),
+        OsStr::new("--no-renames"),
+        OsStr::new("--relative"),
+        OsStr::new("--"),
+    ];
+    diff.extend(scopes.iter().map(OsStr::new));
+    let output = require_success("diff", run_git(directory, diff)?)?;
     let entries = changed_paths(&output.stdout)?;
     let prefix = repository_prefix(directory)?;
     let mut before = BTreeMap::new();
@@ -128,14 +111,14 @@ fn infer_commit_message(directory: &Path) -> Result<String, ArchiveError> {
         let repository_path = prefix.join(&path);
         if status != b'A' {
             let source = git_blob(directory, &format!("HEAD:{}", git_path(&repository_path)))?;
-            match source.and_then(|source| target_snapshots(&path, &source)) {
+            match source.and_then(|source| target_snapshots(&path, root_relative, &source)) {
                 Some(targets) => before.extend(targets),
                 None => recognized_all_markfiles = false,
             }
         }
         if status != b'D' {
             let source = git_blob(directory, &format!(":{}", git_path(&repository_path)))?;
-            match source.and_then(|source| target_snapshots(&path, &source)) {
+            match source.and_then(|source| target_snapshots(&path, root_relative, &source)) {
                 Some(targets) => after.extend(targets),
                 None => recognized_all_markfiles = false,
             }
@@ -264,8 +247,12 @@ struct TargetSnapshot {
     public: bool,
 }
 
-fn target_snapshots(path: &Path, source: &str) -> Option<BTreeMap<String, TargetSnapshot>> {
-    let namespace = module_path(path)?;
+fn target_snapshots(
+    path: &Path,
+    root_relative: &Path,
+    source: &str,
+) -> Option<BTreeMap<String, TargetSnapshot>> {
+    let namespace = module_path(path, root_relative)?;
     let parsed = Parser::new(ParseMode::Build).parse(namespace.clone(), source);
     let module = parsed.module()?;
     let includes = module
@@ -310,8 +297,8 @@ fn target_snapshots(path: &Path, source: &str) -> Option<BTreeMap<String, Target
     )
 }
 
-fn module_path(path: &Path) -> Option<ModulePath> {
-    if path == Path::new("main.mf") {
+fn module_path(path: &Path, root_relative: &Path) -> Option<ModulePath> {
+    if path == root_relative {
         return Some(ModulePath::root());
     }
     let mut segments = path
@@ -356,7 +343,8 @@ mod tests {
     #[test]
     fn target_snapshots_include_semantic_target_content() {
         let source = "> crate::shared::ready as dependency\n---\n# publish\n> dependency\nShip it.\n- It shipped.\n---\n> publish\n";
-        let targets = target_snapshots(Path::new("release.mf"), source).unwrap();
+        let targets =
+            target_snapshots(Path::new("release.mf"), Path::new("main.mf"), source).unwrap();
         let target = targets.get("release::publish").unwrap();
 
         assert_eq!(target.description, "Ship it.");
@@ -368,6 +356,7 @@ mod tests {
     #[test]
     fn invalid_markfiles_do_not_produce_misleading_targets() {
         let targets = target_snapshots(
+            Path::new("main.mf"),
             Path::new("main.mf"),
             "---\n# broken\n- specification\ndescription too late\n---\n> broken\n",
         );

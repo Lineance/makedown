@@ -12,7 +12,9 @@ use url::Url;
 
 use crate::core::{ModulePath, TargetId, TargetName};
 use crate::parser::{ParsedModule, ParsedReference};
-use crate::project::{AnalysisDiagnostic, AnalysisMode, ProjectAnalyzer};
+use crate::project::{
+    AnalysisDiagnostic, AnalysisMode, ProjectAnalyzer, ROOT_FILE_NAMES,
+};
 
 // 保存一次跨文件分析的诊断、语法模型与实际读取的源码。
 #[derive(Clone)]
@@ -29,8 +31,12 @@ impl ProjectView {
     pub(super) fn root_for(path: &Path, overlays: &HashMap<PathBuf, String>) -> PathBuf {
         path.ancestors()
             .find_map(|directory| {
-                let candidate = directory.join("main.mf");
-                (candidate.is_file() || overlays.contains_key(&candidate)).then_some(candidate)
+                ROOT_FILE_NAMES
+                    .iter()
+                    .map(|name| directory.join(name))
+                    .find(|candidate| {
+                        candidate.is_file() || overlays.contains_key(candidate.as_path())
+                    })
             })
             .unwrap_or_else(|| path.to_path_buf())
     }

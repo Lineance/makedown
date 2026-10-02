@@ -7,6 +7,35 @@ use crate::parser::{
     DiagnosticSeverity, ParseMode, ParsedInclude, ParsedModule, ParsedReference, Parser,
 };
 
+/// 依优先级列出的四种项目根文件相对路径。
+pub const ROOT_FILE_NAMES: [&str; 4] = ["main.mf", "lib.mf", ".mkd/main.mf", ".mkd/lib.mf"];
+
+/// 从起始目录向上寻找最近的项目根文件，同一目录内按 ROOT_FILE_NAMES 优先级。
+pub fn find_root_file(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|directory| {
+        ROOT_FILE_NAMES
+            .iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// 返回配置目录：平铺布局为根文件所在目录，隐藏布局为其上级。
+pub fn config_directory(root_file: &Path) -> PathBuf {
+    let parent = root_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match parent.file_name() {
+        Some(name) if name == std::ffi::OsStr::new(".mkd") => parent
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        _ => parent.to_path_buf(),
+    }
+}
+
 /// 控制项目分析是否交付核心内存对象。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnalysisMode {
@@ -300,10 +329,13 @@ impl ProjectAnalyzer {
                     }
                 };
                 if metadata.is_dir() {
-                    pending.push(path);
+                    if !is_hidden_entry(&path) {
+                        pending.push(path);
+                    }
                 } else if metadata.is_file()
                     && path.extension().is_some_and(|extension| extension == "mf")
                     && path != self.root_file
+                    && !is_hidden_entry(&path)
                 {
                     let relative = path.strip_prefix(root).expect("file found inside root");
                     let mut segments = relative
@@ -813,6 +845,13 @@ fn parent_segments(path: &ModulePath) -> Vec<String> {
     }
 }
 
+// 判断扫描到的条目是否以点开头而不应作为模块。
+fn is_hidden_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
 // 尽可能规范化路径后判断是否指向同一文件。
 fn same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
@@ -1178,6 +1217,62 @@ mod tests {
                 directory.display()
             );
         }
+    }
+
+    // 验证根发现支持隐藏布局且同目录按文档顺序取优。
+    #[test]
+    fn root_discovery_supports_hidden_layouts_in_documented_order() {
+        let root = fixture(&[
+            (".mkd/main.mf", "---\n# hidden\n---\n> hidden\n"),
+            ("lib.mf", "---\n# lib\n---\n> lib\n"),
+            ("nested/.keep", ""),
+        ]);
+
+        assert_eq!(
+            find_root_file(&root.join("nested")),
+            Some(root.join("lib.mf"))
+        );
+
+        fs::write(root.join("main.mf"), "---\n# flat\n---\n> flat\n").unwrap();
+
+        assert_eq!(
+            find_root_file(&root.join("nested")),
+            Some(root.join("main.mf"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证配置目录在隐藏布局指向上级。
+    #[test]
+    fn config_directory_points_above_hidden_layout() {
+        assert_eq!(config_directory(Path::new(".mkd/main.mf")), Path::new("."));
+        assert_eq!(
+            config_directory(Path::new("host/.mkd/lib.mf")),
+            Path::new("host")
+        );
+        assert_eq!(config_directory(Path::new("proj/main.mf")), Path::new("proj"));
+    }
+
+    // 验证模块扫描忽略点开头的目录与文件。
+    #[test]
+    fn discovery_skips_hidden_directories_and_files() {
+        let root = fixture(&[
+            ("main.mf", "---\n# run\n---\n> run\n"),
+            (".hidden/secret.mf", "---\n# secret\n---\n> secret\n"),
+            (".dot.mf", "---\n# dot\n---\n> dot\n"),
+        ]);
+
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::DryRun)
+            .analyze_all_with_progress(|_| Ok(()))
+            .unwrap();
+
+        assert!(!result.has_errors());
+        for namespace in [".hidden::secret", ".dot"] {
+            assert!(result.diagnostics().iter().all(|diagnostic| {
+                !diagnostic.message().contains(namespace)
+            }));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     // 验证缺失模块和起始目标均被报告。

@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::core::{ModulePath, TargetId, TargetName};
+use crate::project::config_directory;
 
 /// 保存格式版本与命名构建配方。
 #[derive(Debug, Deserialize)]
@@ -72,12 +73,9 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {}
 
 impl ProjectConfig {
-    /// 从入口 Markfile 所在目录读取配置；不存在时返回 None。
+    /// 从配置目录读取 mkd.toml；不存在时返回 None。
     pub fn load(root_file: &Path) -> Result<Option<Self>, ConfigError> {
-        let path = root_file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("mkd.toml");
+        let path = config_directory(root_file).join("mkd.toml");
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
             Err(error)
