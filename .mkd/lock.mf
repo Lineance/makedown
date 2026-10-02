@@ -1,0 +1,14 @@
+> crate::container::deliver as container_deliver
+---
+# lock_module
+mkd.lock 锁定行为的定义。
+- mkd lock 遍历项目导入图，把被引用的每个 .mjar 的项目相对路径与 SHA-256 哈希写入配置目录下的 mkd.lock。
+- 校验为建议性：仅当锁中命中的条目与实际哈希不符时报编译错误；无锁文件或未记录的包放行。
+# deliver
+实现 mkd lock 命令与构建期校验。
+- 锁定后篡改任一被引用包会在分析期得到报错，恢复后构建通过。
+- 锁定与校验被测试覆盖。
+> lock_module
+> container_deliver
+---
+> deliver

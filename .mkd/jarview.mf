@@ -1,0 +1,14 @@
+> crate::container::deliver as container_deliver
+---
+# jarview_module
+包视图行为的定义。
+- mkd graph --jar path.mjar 把包当独立项目挂载并渲染其依赖图，终端、DOT、SVG 与交互格式均可。
+# deliver
+实现 mkd graph --jar。
+- 对合法 .mjar 渲染出与源项目等价的图。
+- 损坏的包给出明确错误而不是崩溃。
+- 行为被测试覆盖。
+> jarview_module
+> container_deliver
+---
+> deliver

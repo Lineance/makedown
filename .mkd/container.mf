@@ -1,0 +1,14 @@
+---
+# container_module
+.mjar 容器与挂载语义的定义。
+- 容器为 zip：内含 manifest.toml（format、name、crate_roots）与按原目录结构保留的 .mf 文件，lib.mf 为容器内根。
+- 导入写法 > crate::vendor::*test::check，test 段以 * 前缀标记包；包挂在 vendor::test 命名空间，与本地模块寻址同构。
+- 包内 crate:: 锚点重定向到包自身的根，self 与 super 语义原样保留；与本地模块撞名复用既有重复命名空间错误。
+# deliver
+实现 .mjar 容器与挂载加载。
+- * 导入能把包内可达图并入项目分析并参与依赖校验。
+- 坏容器、坏 manifest、包内再出现 * 导入（禁止嵌套）均产生带定位的诊断。
+- 挂载、锚点重定向与错误路径被单元与端到端测试覆盖。
+> container_module
+---
+> deliver

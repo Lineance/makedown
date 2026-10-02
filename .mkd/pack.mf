@@ -1,0 +1,18 @@
+> crate::layout::deliver as layout_deliver
+> crate::container::deliver as container_deliver
+---
+# pack_module
+mkd pack 打包行为的定义。
+- 打包从 lib.mf 公开区出发收集可达模块并剪枝不可达模块，保留原有目录结构写入确定性 zip（固定时间戳）。
+- 被导入的包整体展开为新包内的子树并登记 crate_root；打包项目自己的 * 导入行改写为普通模块引用，包内文件零改写。
+- 产物默认写到配置目录下 dist/<项目目录名>.mjar。
+# deliver
+实现 mkd pack 命令。
+- 对 lib.mf 根项目打包得到 .mjar，产物经完整加载自校验。
+- 非 lib.mf 根项目执行 mkd pack 得到明确错误。
+- 展开、剪枝、改写与自校验被测试覆盖。
+> pack_module
+> layout_deliver
+> container_deliver
+---
+> deliver

@@ -1,0 +1,20 @@
+> crate::layout::deliver as layout_deliver
+> crate::container::deliver as container_deliver
+> crate::pack::deliver as pack_deliver
+> crate::lock::deliver as lock_deliver
+> crate::jarview::deliver as jarview_deliver
+> crate::docs::deliver as docs_deliver
+---
+# deliver
+交付隐藏布局、.mjar 打包与哈希锁定能力。
+- 三种 init 布局（应用默认 .mkd/、--lib 包平铺、--flat 逃生口）按约定工作。
+- mkd pack / mkd lock / mkd graph --jar 端到端可用且被测试覆盖。
+- 文档覆盖新语法与新命令。
+> layout_deliver
+> container_deliver
+> pack_deliver
+> lock_deliver
+> jarview_deliver
+> docs_deliver
+---
+> deliver

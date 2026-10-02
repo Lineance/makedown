@@ -1,0 +1,21 @@
+> crate::layout::deliver as layout_deliver
+> crate::container::deliver as container_deliver
+> crate::pack::deliver as pack_deliver
+> crate::lock::deliver as lock_deliver
+> crate::jarview::deliver as jarview_deliver
+---
+# docs_module
+文档与示例覆盖面的定义。
+- docs/config.md 讲清三种 init 布局、四种根、* 导入语法、pack/lock/graph --jar 的工作流。
+- 示例与 README 与实际行为一致。
+# deliver
+完成文档与示例更新。
+- 新用户按文档可从 init 走到 pack 与导入使用的闭环。
+> docs_module
+> layout_deliver
+> container_deliver
+> pack_deliver
+> lock_deliver
+> jarview_deliver
+---
+> deliver
