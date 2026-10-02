@@ -23,3 +23,4 @@ pub mod lsp;
 pub mod parser;
 /// 提供项目加载、引用解析与图校验能力。
 pub mod project;
+pub mod mjar;

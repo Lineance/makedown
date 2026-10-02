@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::{Module, ModulePath, Project, Spec, Target, TargetId, TargetName};
+use crate::mjar::JarReader;
 use crate::parser::{
     DiagnosticSeverity, ParseMode, ParsedInclude, ParsedModule, ParsedReference, Parser,
 };
@@ -137,6 +138,8 @@ impl AnalysisDiagnostic {
 pub struct AnalysisResult {
     project: Option<Project>,
     diagnostics: Vec<AnalysisDiagnostic>,
+    // 分析过程中被挂载的全部包文件路径。
+    jar_paths: Vec<PathBuf>,
 }
 
 impl AnalysisResult {
@@ -153,6 +156,11 @@ impl AnalysisResult {
     /// 返回加载、解析和解析引用的全部诊断。
     pub fn diagnostics(&self) -> &[AnalysisDiagnostic] {
         &self.diagnostics
+    }
+
+    /// 返回分析期间挂载的全部 .mjar 包路径。
+    pub fn jar_paths(&self) -> &[PathBuf] {
+        &self.jar_paths
     }
 
     /// 判断是否存在阻塞项目构建的诊断。
@@ -262,11 +270,7 @@ impl ProjectAnalyzer {
 
     // 根据项目根目录扫描全部 .mf 文件并按模块路径排序。
     fn discover_modules(&self) -> std::io::Result<(Vec<ModulePath>, Vec<AnalysisDiagnostic>)> {
-        let root = self
-            .root_file
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let root = self.root_directory();
         let canonical_root = root.canonicalize()?;
         let mut pending = vec![root.to_path_buf()];
         let mut visited = BTreeSet::new();
@@ -382,17 +386,35 @@ impl ProjectAnalyzer {
             return self.root_file.clone();
         }
 
-        let mut path = self
-            .root_file
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .to_path_buf();
+        let mut path = self.root_directory().to_path_buf();
         for segment in &namespace.segments()[..namespace.segments().len() - 1] {
             path.push(segment);
         }
         path.push(format!("{}.mf", namespace.segments().last().unwrap()));
         path
     }
+
+    // 返回项目根文件所在目录。
+    fn root_directory(&self) -> &Path {
+        self.root_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+}
+
+// 描述一个已挂载的 .mjar 包。
+struct JarMount {
+    // 包文件路径。
+    path: PathBuf,
+    // 登记的 crate 锚点命名空间（含挂载前缀）。
+    crate_roots: Vec<ModulePath>,
+}
+
+// 表示模块源文本的存放位置。
+enum ModuleSource {
+    Disk(PathBuf),
+    Jar { path: PathBuf, relative: ModulePath },
 }
 
 // 保存一次按需项目分析的工作集和诊断。
@@ -406,6 +428,10 @@ struct AnalysisState<'a> {
     // 防止导入环导致重复读取模块。
     visited: BTreeSet<ModulePath>,
     diagnostics: Vec<AnalysisDiagnostic>,
+    // 已打开的包文件，键为包文件路径。
+    jars: BTreeMap<PathBuf, JarReader>,
+    // 已挂载的包，键为挂载命名空间。
+    mounts: BTreeMap<ModulePath, JarMount>,
 }
 
 impl<'a> AnalysisState<'a> {
@@ -423,6 +449,8 @@ impl<'a> AnalysisState<'a> {
             module_files: BTreeMap::new(),
             visited: BTreeSet::new(),
             diagnostics: Vec::new(),
+            jars: BTreeMap::new(),
+            mounts: BTreeMap::new(),
         }
     }
 
@@ -438,9 +466,16 @@ impl<'a> AnalysisState<'a> {
                 continue;
             }
 
-            let file = self.analyzer.module_file(&namespace);
+            let location = self.module_source(&namespace);
+            let file = match &location {
+                ModuleSource::Disk(path) => path.clone(),
+                ModuleSource::Jar { path, .. } => path.clone(),
+            };
             self.module_files.insert(namespace.clone(), file.clone());
-            if !namespace.is_root() && same_file(&file, &self.analyzer.root_file) {
+            if let ModuleSource::Disk(_) = location
+                && !namespace.is_root()
+                && same_file(&file, &self.analyzer.root_file)
+            {
                 self.diagnostics.push(AnalysisDiagnostic::error(
                     file,
                     None,
@@ -449,16 +484,36 @@ impl<'a> AnalysisState<'a> {
                 ));
                 continue;
             }
-            let source = match read_source(&file) {
-                Ok(source) => source,
-                Err(error) => {
-                    self.diagnostics.push(AnalysisDiagnostic::error(
-                        file,
-                        None,
-                        "P001",
-                        format!("cannot read module `{namespace}`: {error}"),
-                    ));
-                    continue;
+            let source = match &location {
+                ModuleSource::Disk(path) => match read_source(path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.diagnostics.push(AnalysisDiagnostic::error(
+                            file,
+                            None,
+                            "P001",
+                            format!("cannot read module `{namespace}`: {error}"),
+                        ));
+                        continue;
+                    }
+                },
+                ModuleSource::Jar { path, relative } => {
+                    let jar = self
+                        .jars
+                        .get_mut(path)
+                        .expect("a mounted package is open");
+                    match jar.read_module(relative) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            self.diagnostics.push(AnalysisDiagnostic::error(
+                                file,
+                                None,
+                                "P022",
+                                error.to_string(),
+                            ));
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -520,9 +575,17 @@ impl<'a> AnalysisState<'a> {
             .iter()
             .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
         let project = (!has_errors && self.analyzer.mode == AnalysisMode::Build).then_some(project);
+        let mut jar_paths = self
+            .mounts
+            .values()
+            .map(|mount| mount.path.clone())
+            .collect::<Vec<_>>();
+        jar_paths.sort();
+        jar_paths.dedup();
         AnalysisResult {
             project,
             diagnostics: self.diagnostics,
+            jar_paths,
         }
     }
 
@@ -700,32 +763,67 @@ impl<'a> AnalysisState<'a> {
                 return None;
             }
         };
-        let mut module_segments = match segments[0].as_str() {
-            "crate" => Vec::new(),
-            "self" => parent_segments(current),
-            "super" => {
-                let parent = parent_segments(current);
-                if parent.is_empty() {
-                    self.diagnostics.push(AnalysisDiagnostic::error(
-                        file.to_owned(),
-                        Some(reference.line()),
-                        "P015",
-                        "`super` escapes the project root",
-                    ));
-                    return None;
-                }
-                parent[..parent.len() - 1].to_vec()
-            }
-            _ => {
+
+        // * 前缀标记包段：包名必须紧邻目标名。
+        let star = segments[1..segments.len() - 1]
+            .iter()
+            .position(|segment| segment.starts_with('*'));
+        if let Some(offset) = star {
+            let index = offset + 1;
+            if index != segments.len() - 2 {
                 self.diagnostics.push(AnalysisDiagnostic::error(
                     file.to_owned(),
                     Some(reference.line()),
-                    "P011",
-                    "an include path must start with `crate`, `self`, or `super`",
+                    "P020",
+                    "a package import must name its package directly before the target",
                 ));
                 return None;
             }
-        };
+            let stem = segments[index].strip_prefix('*').unwrap_or("");
+            if ModulePath::new(vec![stem.to_owned()]).is_err() {
+                self.diagnostics.push(AnalysisDiagnostic::error(
+                    file.to_owned(),
+                    Some(reference.line()),
+                    "P020",
+                    format!("`{stem}` is not a valid package name"),
+                ));
+                return None;
+            }
+            if self.mount_of(current).is_some() {
+                self.diagnostics.push(AnalysisDiagnostic::error(
+                    file.to_owned(),
+                    Some(reference.line()),
+                    "P021",
+                    "packages cannot be nested; expand them when packing",
+                ));
+                return None;
+            }
+            let anchor = self.anchor_segments(current, segments[0].as_str(), file, reference.line())?;
+            let mut mount_segments = anchor;
+            mount_segments.extend(segments[1..index].iter().cloned());
+            mount_segments.push(stem.to_owned());
+            let mount = match ModulePath::new(mount_segments) {
+                Ok(mount) => mount,
+                Err(error) => {
+                    self.diagnostics.push(AnalysisDiagnostic::error(
+                        file.to_owned(),
+                        Some(reference.line()),
+                        "P012",
+                        error.to_string(),
+                    ));
+                    return None;
+                }
+            };
+            let mut jar_path = self.analyzer.root_directory().to_path_buf();
+            for segment in &segments[1..index] {
+                jar_path.push(segment);
+            }
+            jar_path.push(format!("{stem}.mjar"));
+            return self.mount_package(mount, &jar_path, reference, file, target_name);
+        }
+
+        let anchor = self.anchor_segments(current, segments[0].as_str(), file, reference.line())?;
+        let mut module_segments = anchor;
         module_segments.extend_from_slice(&segments[1..segments.len() - 1]);
         let namespace = match ModulePath::new(module_segments) {
             Ok(namespace) => namespace,
@@ -740,6 +838,154 @@ impl<'a> AnalysisState<'a> {
             }
         };
         Some(TargetId::new(namespace, target_name))
+    }
+
+    // 解析 crate/self/super 锚点为当前模块的基础分段。
+    fn anchor_segments(
+        &mut self,
+        current: &ModulePath,
+        anchor: &str,
+        file: &Path,
+        line: usize,
+    ) -> Option<Vec<String>> {
+        match anchor {
+            "crate" => Some(self.crate_anchor(current).segments().to_vec()),
+            "self" => Some(parent_segments(current)),
+            "super" => {
+                let parent = parent_segments(current);
+                if parent.is_empty() {
+                    self.diagnostics.push(AnalysisDiagnostic::error(
+                        file.to_owned(),
+                        Some(line),
+                        "P015",
+                        "`super` escapes the project root",
+                    ));
+                    None
+                } else {
+                    Some(parent[..parent.len() - 1].to_vec())
+                }
+            }
+            _ => {
+                self.diagnostics.push(AnalysisDiagnostic::error(
+                    file.to_owned(),
+                    Some(line),
+                    "P011",
+                    "an include path must start with `crate`, `self`, or `super`",
+                ));
+                None
+            }
+        }
+    }
+
+    // 打开并登记一个包，返回其根模块的导入目标。
+    fn mount_package(
+        &mut self,
+        mount: ModulePath,
+        jar_path: &Path,
+        reference: &ParsedReference,
+        file: &Path,
+        target: TargetName,
+    ) -> Option<TargetId> {
+        if !self.mounts.contains_key(&mount) {
+            let reader = match JarReader::open(jar_path) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    self.diagnostics.push(AnalysisDiagnostic::error(
+                        file.to_owned(),
+                        Some(reference.line()),
+                        "P022",
+                        error.to_string(),
+                    ));
+                    return None;
+                }
+            };
+            let roots = match reader.crate_root_namespaces() {
+                Ok(roots) => roots,
+                Err(error) => {
+                    self.diagnostics.push(AnalysisDiagnostic::error(
+                        file.to_owned(),
+                        Some(reference.line()),
+                        "P022",
+                        error.to_string(),
+                    ));
+                    return None;
+                }
+            };
+            // 包模块与本地磁盘文件撞名时立即报告，避免挂载遮蔽源文件。
+            for relative in reader.modules() {
+                let full = join_namespaces(&mount, relative);
+                let disk = self.analyzer.module_file(&full);
+                if disk.is_file() {
+                    self.diagnostics.push(AnalysisDiagnostic::error(
+                        file.to_owned(),
+                        Some(reference.line()),
+                        "P002",
+                        format!(
+                            "duplicate module namespace `{full}`: provided by both package `{}` and local file `{}`",
+                            jar_path.display(),
+                            disk.display()
+                        ),
+                    ));
+                    return None;
+                }
+            }
+            let crate_roots = roots
+                .into_iter()
+                .map(|root| join_namespaces(&mount, &root))
+                .collect::<Vec<_>>();
+            self.jars.insert(
+                jar_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| jar_path.to_path_buf()),
+                reader,
+            );
+            self.mounts.insert(
+                mount.clone(),
+                JarMount {
+                    path: jar_path.to_path_buf(),
+                    crate_roots,
+                },
+            );
+        }
+        Some(TargetId::new(mount, target))
+    }
+
+    // 返回模块源文本的存放位置。
+    fn module_source(&self, namespace: &ModulePath) -> ModuleSource {
+        let mount = self
+            .mounts
+            .iter()
+            .filter(|(mounted, _)| {
+                namespace
+                    .segments()
+                    .starts_with(&mounted.segments()[..])
+            })
+            .max_by_key(|(mounted, _)| mounted.segments().len());
+        match mount {
+            Some((mounted, info)) => ModuleSource::Jar {
+                path: info.path.clone(),
+                relative: sub_namespace(namespace, mounted.segments().len()),
+            },
+            None => ModuleSource::Disk(self.analyzer.module_file(namespace)),
+        }
+    }
+
+    // 返回包含当前模块的挂载命名空间。
+    fn mount_of(&self, current: &ModulePath) -> Option<&ModulePath> {
+        self.mounts
+            .keys()
+            .find(|mounted| current.segments().starts_with(&mounted.segments()[..]))
+    }
+
+    // 返回当前模块的 crate 锚点：包内模块锚定包自身的根。
+    fn crate_anchor(&self, current: &ModulePath) -> ModulePath {
+        self.mounts
+            .values()
+            .flat_map(|mount| mount.crate_roots.iter())
+            .filter(|root| current.segments().starts_with(&root.segments()[..]))
+            .max_by_key(|root| root.segments().len())
+            .cloned()
+            .unwrap_or_else(ModulePath::root)
     }
 
     // 校验用户指定的起始目标存在。
@@ -852,6 +1098,19 @@ fn is_hidden_entry(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+// 连接挂载前缀与包内相对命名空间。
+fn join_namespaces(prefix: &ModulePath, relative: &ModulePath) -> ModulePath {
+    let mut segments = prefix.segments().to_vec();
+    segments.extend(relative.segments().iter().cloned());
+    ModulePath::new(segments).expect("joining valid namespaces stays valid")
+}
+
+// 截取命名空间去掉指定长度前缀后的部分。
+fn sub_namespace(namespace: &ModulePath, prefix_len: usize) -> ModulePath {
+    let segments = namespace.segments()[prefix_len..].to_vec();
+    ModulePath::new(segments).expect("suffixes of valid namespaces stay valid")
+}
+
 // 尽可能规范化路径后判断是否指向同一文件。
 fn same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
@@ -863,6 +1122,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mjar::JarBuilder;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // 为测试快速构造经过校验的目标标识。
@@ -1272,6 +1532,172 @@ mod tests {
                 !diagnostic.message().contains(namespace)
             }));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 在临时目录内写入一个示例包。
+    fn write_jar(root: &Path, relative: &str, name: &str, modules: &[(String, &str)]) -> PathBuf {
+        let mut builder = JarBuilder::new();
+        builder.name(name);
+        for (namespace, source) in modules {
+            let namespace = if namespace.is_empty() {
+                ModulePath::root()
+            } else {
+                ModulePath::parse(namespace).unwrap()
+            };
+            builder.add_module(&namespace, *source);
+        }
+        let path = root.join(relative);
+        builder.write_to(&path).unwrap();
+        path
+    }
+
+    // 验证 * 导入挂载包并将包内可达图并入项目分析。
+    #[test]
+    fn package_import_mounts_the_jar_and_resolves_internal_references() {
+        let root = fixture(&[]);
+        write_jar(
+            &root,
+            "vendor/utils.mjar",
+            "utils",
+            &[
+                (
+                    String::new(),
+                    "> crate::dep::verify\n> crate::sub::mod::combine\n---\n# check\n> verify\n> combine\n检查。\n- 检查通过。\n---\n> check\n",
+                ),
+                (
+                    "dep".to_owned(),
+                    "---\n# verify\n- 校验通过。\n---\n> verify\n",
+                ),
+                (
+                    "sub::mod".to_owned(),
+                    "> self::peer::peer\n> super::dep::verify\n---\n# combine\n> peer\n> verify\n---\n> combine\n",
+                ),
+                (
+                    "sub::peer".to_owned(),
+                    "---\n# peer\n- 同伴就绪。\n---\n> peer\n",
+                ),
+            ],
+        );
+        fs::write(
+            root.join("main.mf"),
+            "> crate::vendor::*utils::check as pkg_check\n---\n# run\n> pkg_check\n运行。\n---\n> run\n",
+        )
+        .unwrap();
+
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::Build)
+            .analyze(id(ModulePath::root(), "run"));
+
+        assert!(!result.has_errors(), "{:?}", result.diagnostics());
+        let project = result.project().unwrap();
+        let run = project.root().unwrap().target("run").unwrap();
+        assert_eq!(
+            run.dependencies(),
+            &[id(path("vendor::utils"), "check")]
+        );
+        let check = project
+            .module(&path("vendor::utils"))
+            .unwrap()
+            .target("check")
+            .unwrap();
+        assert_eq!(
+            check.dependencies(),
+            &[
+                id(path("vendor::utils::dep"), "verify"),
+                id(path("vendor::utils::sub::mod"), "combine"),
+            ]
+        );
+        let combine = project
+            .module(&path("vendor::utils::sub::mod"))
+            .unwrap()
+            .target("combine")
+            .unwrap();
+        assert_eq!(
+            combine.dependencies(),
+            &[
+                id(path("vendor::utils::sub::peer"), "peer"),
+                id(path("vendor::utils::dep"), "verify"),
+            ]
+        );
+        assert_eq!(
+            result.jar_paths(),
+            &[root.join("vendor/utils.mjar")]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证缺失包、非法包段位置与嵌套导入都有定位诊断。
+    #[test]
+    fn package_import_reports_missing_misplaced_or_nested_references() {
+        let root = fixture(&[]);
+        write_jar(
+            &root,
+            "nested.mjar",
+            "nested",
+            &[(
+                String::new(),
+                "> crate::*other::x\n---\n# entry\n- 入口。\n---\n> entry\n",
+            )],
+        );
+        fs::write(
+            root.join("main.mf"),
+            "> crate::vendor::*missing::x\n> crate::*nested::entry\n> crate::vendor::*utils::sub::check\n---\n# run\n- 运行。\n---\n> run\n",
+        )
+        .unwrap();
+
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::DryRun)
+            .analyze(id(ModulePath::root(), "run"));
+        let codes = result
+            .diagnostics()
+            .iter()
+            .map(AnalysisDiagnostic::code)
+            .collect::<BTreeSet<_>>();
+
+        assert!(result.project().is_none());
+        assert!(codes.contains("P020"));
+        assert!(codes.contains("P021"));
+        assert!(codes.contains("P022"));
+        assert!(
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "P022"
+                    && diagnostic.message().contains("missing.mjar"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证包挂载与本地模块文件撞名时报重复命名空间错误。
+    #[test]
+    fn package_mount_collides_with_local_modules() {
+        let root = fixture(&[]);
+        write_jar(
+            &root,
+            "dup.mjar",
+            "dup",
+            &[(
+                String::new(),
+                "---\n# entry\n- 入口。\n---\n> entry\n",
+            )],
+        );
+        fs::write(root.join("dup.mf"), "---\n# local\n- 本地。\n---\n> local\n").unwrap();
+        fs::write(
+            root.join("main.mf"),
+            "> crate::*dup::entry\n---\n# run\n- 运行。\n---\n> run\n",
+        )
+        .unwrap();
+
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::DryRun)
+            .analyze(id(ModulePath::root(), "run"));
+
+        assert!(result.project().is_none());
+        assert!(
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "P002"
+                    && diagnostic.message().contains("duplicate module namespace `dup`"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

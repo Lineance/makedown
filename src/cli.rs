@@ -644,6 +644,7 @@ fn compile_target(
         return Ok(());
     }
 
+    let jars = analysis.jar_paths().to_vec();
     let project = analysis
         .into_project()
         .ok_or(CliError::ProjectUnavailable)?;
@@ -696,6 +697,7 @@ fn compile_target(
         || project_input_files(root_file, &project)
             .iter()
             .any(|path| paths_alias(&output, path))
+        || jars.iter().any(|path| paths_alias(&output, path))
         || paths_alias(&output, &config_directory(root_file).join("mkd.toml"))
     {
         return Err(CliError::OutputAliasesInput(output));
@@ -749,6 +751,7 @@ fn execute_graph(
     if analysis.has_errors() {
         return Err(CliError::AnalysisFailed);
     }
+    let jars = analysis.jar_paths().to_vec();
     let project = analysis
         .into_project()
         .ok_or(CliError::ProjectUnavailable)?;
@@ -764,7 +767,7 @@ fn execute_graph(
                 .unwrap_or_else(|| Path::new("."))
                 .join("graph.svg")
         });
-        prepare_graph_output(&export_path, root_file, &project)?;
+        prepare_graph_output(&export_path, root_file, &project, &jars)?;
         interactive::run(
             &project,
             &renderer,
@@ -780,7 +783,7 @@ fn execute_graph(
     }
 
     if let Some(path) = image {
-        prepare_graph_output(&path, root_file, &project)?;
+        prepare_graph_output(&path, root_file, &project, &jars)?;
         let svg = renderer
             .render_svg(&project, target.as_ref())
             .map_err(CliError::Graph)?;
@@ -803,7 +806,7 @@ fn execute_graph(
     .map_err(CliError::Graph)?;
 
     if let Some(path) = output {
-        prepare_graph_output(&path, root_file, &project)?;
+        prepare_graph_output(&path, root_file, &project, &jars)?;
         fs::write(&path, graph).map_err(|source| CliError::WriteOutput {
             path: path.clone(),
             source,
@@ -826,7 +829,12 @@ fn execute_graph(
     }
 }
 
-fn prepare_graph_output(path: &Path, root_file: &Path, project: &Project) -> Result<(), CliError> {
+fn prepare_graph_output(
+    path: &Path,
+    root_file: &Path,
+    project: &Project,
+    jars: &[PathBuf],
+) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::WriteOutput {
             path: path.to_path_buf(),
@@ -837,6 +845,7 @@ fn prepare_graph_output(path: &Path, root_file: &Path, project: &Project) -> Res
         || project_input_files(root_file, project)
             .iter()
             .any(|input| paths_alias(path, input))
+        || jars.iter().any(|input| paths_alias(path, input))
         || paths_alias(path, &config_directory(root_file).join("mkd.toml"))
     {
         return Err(CliError::OutputAliasesInput(path.to_path_buf()));
