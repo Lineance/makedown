@@ -69,7 +69,7 @@ cd my-project
 mkd build
 ```
 
-工具会在 `my-project` 中创建入口文件 `main.mf` 和构建设置 `mkd.toml`，再将实施计划写入 `dist/plan.md`。新项目中的目标叫 `start`。完整的初始化方式和配置写法见[项目配置说明](docs/config.md)。
+工具会在 `my-project` 中创建入口文件 `main.mf` 和构建设置 `mkd.toml`，同时运行 `git init` 初始化 Git 仓库，再将实施计划写入 `dist/plan.md`。新项目中的目标叫 `start`。完整的初始化方式和配置写法见[项目配置说明](docs/config.md)。
 
 `mkd init` 创建的 `main.mf` 同样由上述三个区域组成，只是顶部导入区为空，文件以 `---` 开头。把示例文字改成自己的工作内容，再按同样的方式添加前置目标即可。
 
@@ -77,6 +77,48 @@ mkd build
 
 `mkd target start -o plan.md` 直接为 `start` 目标生成计划，并把文件写入 `plan.md`。需要先检查而暂不写文件时，使用 `mkd target start --check`。这里的 `-o` 指定输出文件；`target` 后还可以写带模块路径的目标名，例如 `catalog::publish`，表示 `catalog` 文件模块中的 `publish` 目标。命令行里的目标路径默认从入口文件算起，不需要写 `crate::` 前缀。
 
-若经常生成同一份计划，可以在 `mkd.toml` 里保存目标、输出路径和可选的排版模板。这组设置叫构建配方。`mkd build` 使用默认配方，`mkd build NAME` 使用指定名称的配方；`mkd target` 则直接按命令行给出的目标和输出文件运行。要检查单份文件，可用 `mkd lint main.mf`；要格式化它，可用 `mkd fmt main.mf`。有关命令和路径的具体规则见[项目配置说明](docs/config.md)。
+若经常生成同一份计划，可以在 `mkd.toml` 里保存目标、输出路径和可选的排版模板。这组设置叫构建配方。`mkd build` 使用默认配方，`mkd build NAME` 使用指定名称的配方；`mkd target` 则直接按命令行给出的目标和输出文件运行。要检查单份文件，可用 `mkd lint main.mf`；要格式化它，可用 `mkd fmt main.mf`。
+
+## 在终端查看依赖图
+
+运行 `mkd graph` 可以把整个项目的 Target 依赖关系直接画在终端中。每份 Markfile 是一个带文件名的分组框，每个 Target 是框内的节点，箭头从前置 Target 指向依赖它的 Target。同一模块的 Target 使用相近颜色，不同模块使用不同主题色；每条边取两端颜色的中间色。颜色遵循全局 `--color auto|always|never` 设置，重定向或写入文件时默认不输出 ANSI 控制符。
+
+```sh
+mkd graph                                      # Unicode、自上而下的全项目图
+mkd graph platform::launch                    # 只看该 Target 及其前置依赖
+mkd graph --direction left-right              # 改为从左向右
+mkd graph --charset ascii --color never       # 适合纯文本日志
+mkd graph --interactive                       # 按模块浏览，选择 Target 查看详情
+mkd graph --image project.svg                 # 直接导出 SVG 图片
+mkd graph --format dot -o project.dot         # 导出 Graphviz DOT
+```
+
+交互模式以 Module 为页面、以 Target 为焦点：每页显示当前模块的全部 Target，以及它们直接依赖的外部 Target；外部节点的依赖在进入对应模块后才展开。按 `h/j/k/l` 或方向键选择相应方向的 Target，选中节点高亮，视框以焦点居中为基准；`Tab` / `Shift-Tab` 可依次选择节点。`Shift+H/J/K/L`（大写 `H/J/K/L`，也支持 Shift+方向键）按一格调整相对观察位置：H 向左、J 向下、K 向上、L 向右，图向相反方向移动。偏移在选择 Target、切换模块及返回时保留，顶部显示当前偏移；范围受视框大小限制，并尽量保持焦点可见。图边缘可以留白，让边缘 Target 也能居中。
+
+聚焦 Target 时自动显示缩略浮窗，仅包含该 Target 的绝对逻辑路径名（例如 `module::nested::build`）和 description，支持语法高亮并动态避让焦点。缩略窗最多 48 列、10 行，长描述以 `…` 表示截断，空描述只显示路径名；它不拦截导航键，也不进入导出图片。
+
+选中本模块 Target 后按 `Enter` 打开描述、规格和依赖的详情浮窗，缩略窗由详情窗替代；再按 `Enter` 或 `Esc` 收起详情后，缩略窗立即恢复。详情浮窗内用 `j/k` 或上下键滚动。浮窗宽度最多 72 列，按终端宽度自动换行；标题、依赖、规格、代码与强调分别高亮（遵循 `--color`）。位置优先在焦点左右或上下避让，必要时缩小；终端过小时才采用最小重叠布局。浮窗打开时也可以用 Shift 导航调整视图，浮窗随之重新布局。选中外部 Target 后，第一次 `Enter` 切换到它所属的模块并保留该 Target 的焦点，在新页面立即显示同一 Target 的缩略窗；第二次 `Enter` 才打开详情。例如 A 中的 Target 依赖 `B::four`，而 `B::four` 依赖 `C::five`：A 页只显示 `B::four`，进入 B 页后才显示 `C::five`。
+
+浮窗关闭时，`Esc` / `Backspace` 返回上一个模块及焦点；`[` / `]` 切换上一个/下一个模块，也可访问没有依赖连线的模块。`mkd graph platform::launch --interactive` 从该 Target 所在模块开始，并选中它。按 `e` 将**当前模块局部图**（不含高亮和浮窗）导出为项目根目录下的 `graph.svg`，按 `Ctrl-C` 退出。可用 `mkd graph --interactive --image dist/project.svg` 为 `e` 指定其他导出位置。
+
+`--image [FILE]` 使用内置导出器直接生成带主题色的矢量 SVG，不要求安装 Graphviz；省略 `FILE` 时写入入口 Markfile 旁的 `graph.svg`，相对路径也以项目根目录为起点。`--direction` 还接受 `bottom-up` 和 `right-left`。DOT 文件仍可继续用 Graphviz 转换成其他格式，例如 `dot -Tpng project.dot -o project.png`。当前图命令只渲染分析成功的项目；若存在语法、引用或依赖环错误，会像其他项目命令一样输出诊断并返回失败。
+
+完成一轮工作后可运行 `mkd archive`。它会从项目根目录暂存全部新增、修改和删除，再创建 Git 提交。提交消息由概括数量的主题行和按动作分组的 Target 清单组成，例如：
+
+```text
+Archive targets: add 2, update 1, remove 1
+
+Add:
+- release
+- docs
+
+Update:
+- test
+
+Remove:
+- draft
+```
+
+若只有普通项目文件变化，则使用单行消息 `Archive project changes`。首次提交前需按 Git 的常规方式配置 `user.name` 和 `user.email`。有关命令和路径的具体规则见[项目配置说明](docs/config.md)。
 
 生成的计划有内置 Markdown 排版。想改成自己的任务清单或交接手册，可以阅读[模板写法](docs/templates.md)和[五种中文模板示例](examples/templates/README.md)。使用编辑器时，可按 [Neovim 配置说明](nvim/README.md)或 [VS Code 插件说明](vscode/README.md)启用 `.mf` 和模板文件的高亮、诊断与补全。

@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::archive::{ArchiveError, archive_project, initialize_repository};
 use crate::compiler::{CompileError, Compiler, DefaultMarkdownRenderer, TemplateMarkdownRenderer};
 use crate::config::{ConfigError, ProjectConfig, project_path};
 use crate::core::{ModulePath, ModulePathError, Project, TargetId, TargetName};
 use crate::formatter::{FormatError, Formatter};
+use crate::graph::{GraphCharset, GraphDirection, GraphRenderError, ProjectGraphRenderer};
+use crate::interactive;
 use crate::linter::Linter;
 use crate::logging::{ColorChoice, Logger};
 use crate::parser::{ParseMode, Parser as MarkfileParser};
@@ -110,12 +113,66 @@ enum Command {
         )]
         check: bool,
     },
-    #[command(about = "Initialize main.mf and mkd.toml")]
+    #[command(about = "Initialize main.mf, mkd.toml, and a Git repository")]
     Init {
         #[arg(value_name = "DIRECTORY")]
         directory: Option<PathBuf>,
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
+    },
+    #[command(about = "Stage all project changes and commit them with an inferred message")]
+    Archive,
+    #[command(about = "Visualize the project Target dependency graph")]
+    Graph {
+        #[arg(
+            value_name = "TARGET",
+            help = "Show TARGET and prerequisites; in interactive mode, select TARGET in its module"
+        )]
+        target: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = GraphFormat::Terminal,
+            help = "Choose terminal text or Graphviz DOT output"
+        )]
+        format: GraphFormat,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = GraphDirectionArg::TopDown,
+            help = "Choose the graph flow direction"
+        )]
+        direction: GraphDirectionArg,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = GraphCharsetArg::Unicode,
+            help = "Choose Unicode box drawing or plain ASCII"
+        )]
+        charset: GraphCharsetArg,
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            conflicts_with = "interactive",
+            help = "Write the graph to FILE instead of stdout"
+        )]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with = "output",
+            help = "Browse modules, select Targets, and open details interactively"
+        )]
+        interactive: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 0..=1,
+            default_missing_value = "graph.svg",
+            conflicts_with = "output",
+            help = "Export an SVG image; defaults to graph.svg beside main.mf"
+        )]
+        image: Option<PathBuf>,
     },
     #[command(about = "Lint a Markfile or every Markfile in the project")]
     Lint {
@@ -137,6 +194,49 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum GraphFormat {
+    #[default]
+    Terminal,
+    Dot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum GraphDirectionArg {
+    #[default]
+    TopDown,
+    BottomUp,
+    LeftRight,
+    RightLeft,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum GraphCharsetArg {
+    #[default]
+    Unicode,
+    Ascii,
+}
+
+impl From<GraphDirectionArg> for GraphDirection {
+    fn from(direction: GraphDirectionArg) -> Self {
+        match direction {
+            GraphDirectionArg::TopDown => Self::TopDown,
+            GraphDirectionArg::BottomUp => Self::BottomUp,
+            GraphDirectionArg::LeftRight => Self::LeftRight,
+            GraphDirectionArg::RightLeft => Self::RightLeft,
+        }
+    }
+}
+
+impl From<GraphCharsetArg> for GraphCharset {
+    fn from(charset: GraphCharsetArg) -> Self {
+        match charset {
+            GraphCharsetArg::Unicode => Self::Unicode,
+            GraphCharsetArg::Ascii => Self::Ascii,
+        }
+    }
+}
+
 /// 描述命令执行期间无法由项目诊断表达的错误。
 #[derive(Debug)]
 enum CliError {
@@ -153,6 +253,11 @@ enum CliError {
     Config(ConfigError),
     ProfileUnavailable(String),
     Init(String),
+    Archive(ArchiveError),
+    Graph(GraphRenderError),
+    InteractiveTerminalRequired,
+    InteractiveFormat,
+    ImageFormat,
     Template {
         path: PathBuf,
         line: Option<usize>,
@@ -172,6 +277,7 @@ enum CliError {
         source: io::Error,
     },
     WriteDiagnostics(io::Error),
+    WriteGraph(io::Error),
 }
 
 impl CliError {
@@ -222,6 +328,16 @@ impl fmt::Display for CliError {
             Self::Compilation(error) => write!(formatter, "compilation failed: {error}"),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::ProfileUnavailable(message) | Self::Init(message) => formatter.write_str(message),
+            Self::Archive(error) => write!(formatter, "archive failed: {error}"),
+            Self::Graph(error) => write!(formatter, "graph rendering failed: {error}"),
+            Self::InteractiveTerminalRequired => formatter
+                .write_str("interactive graph mode requires both stdin and stdout to be terminals"),
+            Self::InteractiveFormat => {
+                formatter.write_str("interactive graph mode only supports terminal format")
+            }
+            Self::ImageFormat => {
+                formatter.write_str("SVG image export cannot be combined with `--format dot`")
+            }
             Self::Template {
                 path,
                 line,
@@ -256,6 +372,7 @@ impl fmt::Display for CliError {
                 write!(formatter, "cannot write `{}`: {source}", path.display())
             }
             Self::WriteDiagnostics(error) => write!(formatter, "cannot write logs: {error}"),
+            Self::WriteGraph(error) => write!(formatter, "cannot write graph: {error}"),
         }
     }
 }
@@ -303,6 +420,65 @@ fn execute(
                 directory.as_deref(),
                 target.as_deref(),
                 current_directory,
+                logger,
+                started,
+            )
+        }
+        Command::Archive => {
+            let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
+            let project_directory = root_file.parent().unwrap_or_else(|| Path::new("."));
+            let message = archive_project(project_directory).map_err(CliError::Archive)?;
+            let subject = message.lines().next().unwrap_or(&message);
+            logger
+                .finished(
+                    &format!("archived project with `{subject}`"),
+                    started.elapsed(),
+                )
+                .map_err(CliError::WriteDiagnostics)
+        }
+        Command::Graph {
+            target,
+            format,
+            direction,
+            charset,
+            output,
+            interactive,
+            image,
+        } => {
+            if interactive && format != GraphFormat::Terminal {
+                return Err(CliError::InteractiveFormat);
+            }
+            if image.is_some() && format != GraphFormat::Terminal {
+                return Err(CliError::ImageFormat);
+            }
+            if interactive && !interactive::terminal_available() {
+                return Err(CliError::InteractiveTerminalRequired);
+            }
+            let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
+            let project_directory = root_file.parent().unwrap_or_else(|| Path::new("."));
+            let target = target.as_deref().map(parse_target_id).transpose()?;
+            let output = output.map(|path| resolve_from(current_directory, &path));
+            let image = image.map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    project_directory.join(path)
+                }
+            });
+            let terminal_allows_color = output.is_none()
+                && io::stdout().is_terminal()
+                && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+            let color = format == GraphFormat::Terminal && cli.color.enabled(terminal_allows_color);
+            execute_graph(
+                &root_file,
+                target,
+                format,
+                direction.into(),
+                charset.into(),
+                output,
+                color,
+                interactive,
+                image,
                 logger,
                 started,
             )
@@ -497,6 +673,137 @@ fn compile_target(
     Ok(())
 }
 
+// 分析健康项目并将 Target DAG 写入终端、交互视框或文件。
+#[allow(clippy::too_many_arguments)]
+fn execute_graph(
+    root_file: &Path,
+    target: Option<TargetId>,
+    format: GraphFormat,
+    direction: GraphDirection,
+    charset: GraphCharset,
+    output: Option<PathBuf>,
+    color: bool,
+    interactive_mode: bool,
+    image: Option<PathBuf>,
+    logger: &mut Logger<impl Write>,
+    started: Instant,
+) -> Result<(), CliError> {
+    let analyzer = ProjectAnalyzer::new(root_file, AnalysisMode::Build);
+    let analysis = if interactive_mode {
+        // Target 在交互模式只决定初始焦点；模块切换仍需完整项目模型。
+        analyzer.analyze_all_with_progress(|module| logger.parsing(module))
+    } else {
+        match &target {
+            Some(target) => {
+                analyzer.analyze_with_progress(target.clone(), |module| logger.parsing(module))
+            }
+            None => analyzer.analyze_all_with_progress(|module| logger.parsing(module)),
+        }
+    }
+    .map_err(CliError::WriteDiagnostics)?;
+    for diagnostic in analysis.diagnostics() {
+        logger
+            .diagnostic(diagnostic)
+            .map_err(CliError::WriteDiagnostics)?;
+    }
+    if analysis.has_errors() {
+        return Err(CliError::AnalysisFailed);
+    }
+    let project = analysis
+        .into_project()
+        .ok_or(CliError::ProjectUnavailable)?;
+    let renderer = ProjectGraphRenderer::new()
+        .with_direction(direction)
+        .with_charset(charset)
+        .with_color(color);
+
+    if interactive_mode {
+        let export_path = image.unwrap_or_else(|| {
+            root_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("graph.svg")
+        });
+        prepare_graph_output(&export_path, root_file, &project)?;
+        interactive::run(
+            &project,
+            &renderer,
+            target.as_ref(),
+            charset,
+            color,
+            export_path,
+        )
+        .map_err(CliError::WriteGraph)?;
+        return logger
+            .finished("closed interactive project graph", started.elapsed())
+            .map_err(CliError::WriteDiagnostics);
+    }
+
+    if let Some(path) = image {
+        prepare_graph_output(&path, root_file, &project)?;
+        let svg = renderer
+            .render_svg(&project, target.as_ref())
+            .map_err(CliError::Graph)?;
+        fs::write(&path, svg).map_err(|source| CliError::WriteOutput {
+            path: path.clone(),
+            source,
+        })?;
+        return logger
+            .finished(
+                &format!("exported project graph image to `{}`", path.display()),
+                started.elapsed(),
+            )
+            .map_err(CliError::WriteDiagnostics);
+    }
+
+    let graph = match format {
+        GraphFormat::Terminal => renderer.render_terminal(&project, target.as_ref()),
+        GraphFormat::Dot => renderer.render_dot(&project, target.as_ref()),
+    }
+    .map_err(CliError::Graph)?;
+
+    if let Some(path) = output {
+        prepare_graph_output(&path, root_file, &project)?;
+        fs::write(&path, graph).map_err(|source| CliError::WriteOutput {
+            path: path.clone(),
+            source,
+        })?;
+        logger
+            .finished(
+                &format!("wrote project graph to `{}`", path.display()),
+                started.elapsed(),
+            )
+            .map_err(CliError::WriteDiagnostics)
+    } else {
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(graph.as_bytes())
+            .and_then(|()| stdout.flush())
+            .map_err(CliError::WriteGraph)?;
+        logger
+            .finished("rendered project graph", started.elapsed())
+            .map_err(CliError::WriteDiagnostics)
+    }
+}
+
+fn prepare_graph_output(path: &Path, root_file: &Path, project: &Project) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::WriteOutput {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    if paths_alias(path, root_file)
+        || project_input_files(root_file, project)
+            .iter()
+            .any(|input| paths_alias(path, input))
+        || paths_alias(path, &root_file.with_file_name("mkd.toml"))
+    {
+        return Err(CliError::OutputAliasesInput(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 // 根据目录中已有文件安全初始化可构建项目。
 fn execute_init(
     directory: Option<&Path>,
@@ -613,6 +920,13 @@ fn execute_init(
             path: config_file,
             source,
         });
+    }
+    if let Err(error) = initialize_repository(&directory) {
+        let _ = fs::remove_file(&config_file);
+        if !has_root {
+            let _ = fs::remove_file(&root_file);
+        }
+        return Err(CliError::Archive(error));
     }
     logger
         .finished(
@@ -767,7 +1081,9 @@ fn execute_maintenance(
         Command::Lint { .. }
         | Command::Target { .. }
         | Command::Build { .. }
-        | Command::Init { .. } => {
+        | Command::Init { .. }
+        | Command::Archive
+        | Command::Graph { .. } => {
             return Err(CliError::InvalidArguments);
         }
     }
@@ -898,6 +1214,22 @@ mod tests {
         assert!(Cli::try_parse_from(["mkd", "lint", "file.mf"]).is_ok());
         assert!(Cli::try_parse_from(["mkd", "lint", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["mkd", "lint", "file.mf", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["mkd", "graph"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "mkd",
+                "graph",
+                "workflow::release::release",
+                "--format",
+                "dot",
+                "--direction",
+                "left-right",
+                "-o",
+                "graph.dot",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["mkd", "graph", "--direction", "diagonal"]).is_err());
         assert!(Cli::try_parse_from(["mkd", "fmt", "file.mf", "--check"]).is_ok());
         assert!(Cli::try_parse_from(["mkd", "--check", "fmt", "file.mf"]).is_err());
     }

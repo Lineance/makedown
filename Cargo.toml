@@ -24,11 +24,14 @@ name = "mkd-lsp"
 path = "src/bin/mkd-lsp.rs"
 
 [dependencies]
+ascii-dag = "0.11"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 lsp-server = "0.10"
 lsp-types = "0.97"
 minijinja = { version = "2", features = ["fuel"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+unicode-width = "0.2"
 url = "2.5"

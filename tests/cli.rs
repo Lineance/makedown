@@ -36,6 +36,26 @@ fn run(current_directory: &Path, arguments: &[&str]) -> Output {
         .unwrap()
 }
 
+// 在隔离仓库中运行 Git 并要求命令成功。
+fn git(current_directory: &Path, arguments: &[&str]) -> Output {
+    let output = Command::new("git")
+        .current_dir(current_directory)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {arguments:?}: {output:?}");
+    output
+}
+
+// 为归档测试配置仓库本地提交身份。
+fn configure_git_identity(repository: &Path) {
+    git(repository, &["config", "user.name", "Makedown Test"]);
+    git(
+        repository,
+        &["config", "user.email", "makedown@example.invalid"],
+    );
+}
+
 // 验证从项目深层目录运行时能够向上发现根文件并编译。
 #[test]
 fn binary_discovers_main_from_a_nested_directory() {
@@ -263,6 +283,7 @@ fn init_and_named_profiles_build_reproducibly_from_nested_directory() {
     let project = directory.join("project");
     let initialized = run(&directory, &["init", "project"]);
     assert!(initialized.status.success(), "{initialized:?}");
+    assert!(project.join(".git").is_dir());
     fs::create_dir_all(project.join("nested")).unwrap();
     let default = run(&project.join("nested"), &["build"]);
     assert!(default.status.success(), "{default:?}");
@@ -283,6 +304,133 @@ fn init_and_named_profiles_build_reproducibly_from_nested_directory() {
         fs::read_to_string(project.join("dist/guide.md"))
             .unwrap()
             .contains("guide::write")
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证 archive 暂存全部项目变化并根据 Target 语义变化生成提交消息。
+#[test]
+fn archive_commits_all_changes_with_inferred_target_messages() {
+    let directory = temporary_directory();
+    let project = directory.join("project");
+    let initialized = run(&directory, &["init", "project"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    configure_git_identity(&project);
+
+    fs::write(project.join("notes.txt"), "first\n").unwrap();
+    let first = run(&project, &["archive"]);
+    assert!(first.status.success(), "{first:?}");
+    let first_message = git(&project, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(first_message.stdout).unwrap().trim(),
+        "Archive targets: add 1\n\nAdd:\n- start"
+    );
+    assert!(git(&project, &["status", "--porcelain"]).stdout.is_empty());
+
+    fs::write(
+        project.join("main.mf"),
+        "---\n# launch\nShip the project.\n- The project shipped.\n---\n> launch\n",
+    )
+    .unwrap();
+    fs::write(project.join("notes.txt"), "second\n").unwrap();
+    let second = run(&project, &["archive"]);
+    assert!(second.status.success(), "{second:?}");
+    let second_message = git(&project, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(second_message.stdout).unwrap().trim(),
+        "Archive targets: add 1, remove 1\n\nAdd:\n- launch\n\nRemove:\n- start"
+    );
+    assert!(git(&project, &["status", "--porcelain"]).stdout.is_empty());
+
+    fs::write(
+        project.join("main.mf"),
+        "---\n# launch\nShip the final project.\n- The project shipped.\n---\n> launch\n",
+    )
+    .unwrap();
+    let third = run(&project, &["archive"]);
+    assert!(third.status.success(), "{third:?}");
+    let third_message = git(&project, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(third_message.stdout).unwrap().trim(),
+        "Archive targets: update 1\n\nUpdate:\n- launch"
+    );
+
+    let empty = run(&project, &["archive"]);
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("nothing to archive"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证非 Markfile 变化使用稳定兜底消息，且可从项目子目录归档。
+#[test]
+fn archive_uses_fallback_message_for_non_target_changes() {
+    let directory = temporary_directory();
+    let initialized = run(&directory, &["init"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    configure_git_identity(&directory);
+    assert!(run(&directory, &["archive"]).status.success());
+
+    fs::create_dir_all(directory.join("nested")).unwrap();
+    fs::write(directory.join("notes.txt"), "changed\n").unwrap();
+    let archived = run(&directory.join("nested"), &["archive"]);
+    assert!(archived.status.success(), "{archived:?}");
+    let message = git(&directory, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(message.stdout).unwrap().trim(),
+        "Archive project changes"
+    );
+    assert!(
+        git(&directory, &["status", "--porcelain"])
+            .stdout
+            .is_empty()
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证项目嵌在上级仓库中时，归档只提交项目目录并正确推断 Target 变化。
+#[test]
+fn archive_inside_a_parent_repository_commits_only_the_project_directory() {
+    let directory = temporary_directory();
+    let project = directory.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("main.mf"),
+        "---\n# start\n- ready\n---\n> start\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("mkd.toml"),
+        "version = 1\n[build]\ndefault = 'main'\n[build.main]\ntarget = 'start'\noutput = 'dist/plan.md'\n",
+    )
+    .unwrap();
+    git(&directory, &["init", "--quiet"]);
+    configure_git_identity(&directory);
+    git(&directory, &["add", "."]);
+    git(&directory, &["commit", "--quiet", "-m", "base"]);
+    fs::write(directory.join("outside.txt"), "untouched\n").unwrap();
+
+    fs::write(
+        project.join("main.mf"),
+        "---\n# launch\nShip it.\n- shipped\n---\n> launch\n",
+    )
+    .unwrap();
+    let archived = run(&project, &["archive"]);
+    assert!(archived.status.success(), "{archived:?}");
+    let message = git(&directory, &["log", "-1", "--pretty=%B"]);
+    assert_eq!(
+        String::from_utf8(message.stdout).unwrap().trim(),
+        "Archive targets: add 1, remove 1\n\nAdd:\n- launch\n\nRemove:\n- start"
+    );
+    let committed = git(&directory, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !String::from_utf8(committed.stdout)
+            .unwrap()
+            .contains("outside.txt")
+    );
+    let status = git(&directory, &["status", "--porcelain"]);
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        "?? outside.txt\n"
     );
     fs::remove_dir_all(directory).unwrap();
 }
@@ -492,6 +640,174 @@ fn binary_color_mode_controls_ansi_sequences() {
             .any(|window| window == b"\x1b[1;36")
     );
     assert!(!never.stderr.contains(&0x1b));
+}
+
+// 验证 graph 默认输出模块分组的终端 DAG，并可聚焦单个 Target。
+#[test]
+fn binary_graph_renders_the_project_and_focused_prerequisites() {
+    let project = example("valid", "08-diamond-release");
+    let whole = run(&project, &["graph", "--color", "never"]);
+    assert!(whole.status.success(), "{whole:?}");
+    let graph = String::from_utf8(whole.stdout).unwrap();
+    assert!(graph.contains("shared/schema.mf"));
+    assert!(graph.contains("workflow/release.mf"));
+    assert!(graph.contains("[freeze_schema]"));
+    assert!(graph.contains("[ship]"));
+    assert!(graph.contains('↓'));
+
+    let focused = run(
+        &project,
+        &[
+            "graph",
+            "workflow::release::release",
+            "--charset",
+            "ascii",
+            "--color",
+            "never",
+        ],
+    );
+    assert!(focused.status.success(), "{focused:?}");
+    let graph = String::from_utf8(focused.stdout).unwrap();
+    assert!(graph.contains("[release]"));
+    assert!(graph.contains("[approve]"));
+    assert!(!graph.contains("[ship]"));
+    assert!(!graph.contains('↓'));
+}
+
+// 验证 DOT 图写入文件并携带布局、模块与颜色信息。
+#[test]
+fn binary_graph_exports_colored_dot_without_ansi_sequences() {
+    let project = example("valid", "08-diamond-release");
+    let directory = temporary_directory();
+    let output = directory.join("project.dot");
+    let output_arg = output.to_string_lossy().into_owned();
+    let result = run(
+        &project,
+        &[
+            "graph",
+            "--format",
+            "dot",
+            "--direction",
+            "left-right",
+            "--color",
+            "always",
+            "-o",
+            &output_arg,
+        ],
+    );
+
+    assert!(result.status.success(), "{result:?}");
+    assert!(result.stdout.is_empty());
+    let dot = fs::read_to_string(&output).unwrap();
+    assert!(dot.starts_with("digraph makedown {\n"));
+    assert!(dot.contains("rankdir=LR"));
+    assert!(dot.contains("subgraph cluster_"));
+    assert!(dot.contains("color=\"#"));
+    assert!(!dot.contains('\u{1b}'));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证内置图片导出生成独立真彩色 SVG，并且无需 Graphviz。
+#[test]
+fn binary_graph_exports_a_standalone_svg_image() {
+    let project = example("valid", "08-diamond-release");
+    let directory = temporary_directory();
+    let output = directory.join("project.svg");
+    let output_arg = output.to_string_lossy().into_owned();
+    let result = run(
+        &project,
+        &[
+            "graph",
+            "--direction",
+            "left-right",
+            "--image",
+            &output_arg,
+            "--color",
+            "never",
+        ],
+    );
+
+    assert!(result.status.success(), "{result:?}");
+    assert!(result.stdout.is_empty());
+    let svg = fs::read_to_string(&output).unwrap();
+    assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+    assert!(svg.contains("viewBox="));
+    assert!(svg.contains("fill=\"#"));
+    assert!(svg.contains("[release]"));
+    assert!(!svg.contains('\u{1b}'));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// 验证省略图片文件名时在项目根目录写入 graph.svg。
+#[test]
+fn binary_graph_image_uses_a_project_relative_default() {
+    let project = temporary_directory();
+    fs::write(
+        project.join("main.mf"),
+        "---\n# start\n- ready\n---\n> start\n",
+    )
+    .unwrap();
+
+    let result = run(&project, &["graph", "--image"]);
+    assert!(result.status.success(), "{result:?}");
+    assert!(project.join("graph.svg").is_file());
+    assert!(result.stdout.is_empty());
+    fs::remove_dir_all(project).unwrap();
+}
+
+// 验证交互模式拒绝管道，避免在非 TTY 上破坏终端状态。
+#[test]
+fn binary_graph_interactive_requires_a_terminal() {
+    let project = example("valid", "01-single-target");
+    let result = run(&project, &["graph", "--interactive"]);
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("interactive graph mode requires both stdin and stdout")
+    );
+}
+
+// 验证无效项目和不存在的聚焦目标拒绝生成图，并保留结构化分析诊断。
+#[test]
+fn binary_graph_rejects_invalid_projects_with_diagnostics() {
+    let project = example("invalid", "10-dependency-cycle");
+    let result = run(&project, &["graph", "--color", "never"]);
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("[P014]"));
+    assert!(stderr.contains("dependency cycle"));
+
+    let project = example("valid", "01-single-target");
+    let result = run(&project, &["graph", "missing", "--color", "never"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("[P013]"));
+}
+
+// 验证 graph 文件输出不能覆盖任何项目输入。
+#[test]
+fn binary_graph_refuses_to_overwrite_project_inputs() {
+    let project = temporary_directory();
+    let source = "---\n# start\n- ready\n---\n> start\n";
+    fs::write(project.join("main.mf"), source).unwrap();
+    fs::write(project.join("mkd.toml"), "version = 1\n").unwrap();
+
+    for output in ["main.mf", "mkd.toml"] {
+        let result = run(&project, &["graph", "-o", output]);
+        assert_eq!(result.status.code(), Some(1));
+        let result = run(&project, &["graph", "--image", output]);
+        assert_eq!(result.status.code(), Some(1));
+    }
+    assert_eq!(fs::read_to_string(project.join("main.mf")).unwrap(), source);
+    assert_eq!(
+        fs::read_to_string(project.join("mkd.toml")).unwrap(),
+        "version = 1\n"
+    );
+    fs::remove_dir_all(project).unwrap();
 }
 
 // 验证单文件 lint 警告不阻塞成功，全量 lint 检查未引用文件。

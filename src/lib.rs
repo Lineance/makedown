@@ -1,3 +1,5 @@
+/// 提供基于 Git 的项目归档能力。
+pub mod archive;
 /// 提供 mkd 命令行交互能力。
 pub mod cli;
 /// 提供规格制品编译能力。
@@ -8,6 +10,9 @@ pub mod config;
 pub mod core;
 /// 提供保留规格内容的 Markfile 格式化能力。
 pub mod formatter;
+/// 提供已验证项目的终端 DAG 与 DOT 渲染能力。
+pub mod graph;
+mod interactive;
 /// 提供文件与项目静态检查能力。
 pub mod linter;
 /// 提供可复用的 Cargo 风格日志接口。

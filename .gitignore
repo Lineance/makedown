@@ -7,3 +7,5 @@
 /vscode/icon.png
 /vscode/*.vsix
 /vscode/*.vsixmanifest
+
+/.makedown/
