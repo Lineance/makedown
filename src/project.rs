@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::{Module, ModulePath, Project, Spec, Target, TargetId, TargetName};
+use crate::lock;
 use crate::mjar::JarReader;
 use crate::parser::{
     DiagnosticSeverity, ParseMode, ParsedInclude, ParsedModule, ParsedReference, Parser,
@@ -188,6 +189,7 @@ impl AnalysisResult {
 pub struct ProjectAnalyzer {
     root_file: PathBuf,
     mode: AnalysisMode,
+    verify_lock: bool,
 }
 
 impl ProjectAnalyzer {
@@ -196,7 +198,14 @@ impl ProjectAnalyzer {
         Self {
             root_file: root_file.into(),
             mode,
+            verify_lock: true,
         }
+    }
+
+    /// 生成新锁时允许重新计算已变更包的哈希。
+    pub fn without_lock_verification(mut self) -> Self {
+        self.verify_lock = false;
+        self
     }
 
     /// 从任意起始目标分析其模块可达图。
@@ -289,12 +298,7 @@ impl ProjectAnalyzer {
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let modules = reader.modules().to_vec();
         let mut state = AnalysisState::new(self, None);
-        state.jars.insert(
-            jar_path
-                .canonicalize()
-                .unwrap_or_else(|_| jar_path.to_path_buf()),
-            reader,
-        );
+        state.jars.insert(jar_path.to_path_buf(), reader);
         state.mounts.insert(
             ModulePath::root(),
             JarMount {
@@ -648,7 +652,7 @@ impl<'a> AnalysisState<'a> {
             let Some(target) = self.resolve_path(namespace, include.target(), &file) else {
                 continue;
             };
-            if !self.validate_import(&target, include, &file) {
+            if !self.validate_import(namespace, &target, include, &file) {
                 continue;
             }
             let alias = include.alias().unwrap_or(target.name()).to_owned();
@@ -741,7 +745,25 @@ impl<'a> AnalysisState<'a> {
     }
 
     // 校验导入目标存在且允许跨模块访问。
-    fn validate_import(&mut self, target: &TargetId, include: &ParsedInclude, file: &Path) -> bool {
+    fn validate_import(
+        &mut self,
+        current: &ModulePath,
+        target: &TargetId,
+        include: &ParsedInclude,
+        file: &Path,
+    ) -> bool {
+        if let Some(mount) = self.mount_of(target.namespace())
+            && target.namespace() != mount
+            && !current.segments().starts_with(mount.segments())
+        {
+            self.diagnostics.push(AnalysisDiagnostic::error(
+                file.to_owned(),
+                Some(include.target().line()),
+                "P009",
+                format!("package internal target `{target}` is not exported by lib.mf"),
+            ));
+            return false;
+        }
         let Some(module) = self.parsed_modules.get(target.namespace()) else {
             return false;
         };
@@ -860,7 +882,7 @@ impl<'a> AnalysisState<'a> {
                 }
             };
             let mut jar_path = self.analyzer.root_directory().to_path_buf();
-            for segment in &segments[1..index] {
+            for segment in &mount.segments()[..mount.segments().len() - 1] {
                 jar_path.push(segment);
             }
             jar_path.push(format!("{stem}.mjar"));
@@ -893,17 +915,19 @@ impl<'a> AnalysisState<'a> {
         file: &Path,
         line: usize,
     ) -> Option<Vec<String>> {
+        let crate_root = self.crate_anchor(current);
         match anchor {
-            "crate" => Some(self.crate_anchor(current).segments().to_vec()),
+            "crate" => Some(crate_root.segments().to_vec()),
+            "self" if current == &crate_root => Some(crate_root.segments().to_vec()),
             "self" => Some(parent_segments(current)),
             "super" => {
                 let parent = parent_segments(current);
-                if parent.is_empty() {
+                if parent.len() <= crate_root.segments().len() {
                     self.diagnostics.push(AnalysisDiagnostic::error(
                         file.to_owned(),
                         Some(line),
                         "P015",
-                        "`super` escapes the project root",
+                        "`super` escapes the crate root",
                     ));
                     None
                 } else {
@@ -932,6 +956,17 @@ impl<'a> AnalysisState<'a> {
         target: TargetName,
     ) -> Option<TargetId> {
         if !self.mounts.contains_key(&mount) {
+            if self.analyzer.verify_lock
+                && let Err(message) = lock::verify_jar(&self.analyzer.root_file, jar_path)
+            {
+                self.diagnostics.push(AnalysisDiagnostic::error(
+                    file.to_owned(),
+                    Some(reference.line()),
+                    "P023",
+                    message,
+                ));
+                return None;
+            }
             let reader = match JarReader::open(jar_path) {
                 Ok(reader) => reader,
                 Err(error) => {
@@ -978,12 +1013,7 @@ impl<'a> AnalysisState<'a> {
                 .into_iter()
                 .map(|root| join_namespaces(&mount, &root))
                 .collect::<Vec<_>>();
-            self.jars.insert(
-                jar_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| jar_path.to_path_buf()),
-                reader,
-            );
+            self.jars.insert(jar_path.to_path_buf(), reader);
             self.mounts.insert(
                 mount.clone(),
                 JarMount {
@@ -1015,7 +1045,8 @@ impl<'a> AnalysisState<'a> {
     fn mount_of(&self, current: &ModulePath) -> Option<&ModulePath> {
         self.mounts
             .keys()
-            .find(|mounted| current.segments().starts_with(mounted.segments()))
+            .filter(|mounted| current.segments().starts_with(mounted.segments()))
+            .max_by_key(|mounted| mounted.segments().len())
     }
 
     // 返回当前模块的 crate 锚点：包内模块锚定包自身的根。
@@ -1664,6 +1695,98 @@ mod tests {
             ]
         );
         assert_eq!(result.jar_paths(), &[root.join("vendor/utils.mjar")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证 self/super 包导入从锚点目录寻找包文件。
+    #[test]
+    fn package_file_lookup_respects_self_and_super_anchors() {
+        let root = fixture(&[("main.mf", "---\n# run\n- run\n---\n> run\n")]);
+        write_jar(
+            &root,
+            "sub/local.mjar",
+            "local",
+            &[(String::new(), "---\n# check\n- local\n---\n> check\n")],
+        );
+        write_jar(
+            &root,
+            "shared.mjar",
+            "shared",
+            &[(String::new(), "---\n# check\n- shared\n---\n> check\n")],
+        );
+        fs::write(root.join("sub/consumer.mf"),
+            "> self::*local::check as local_check\n> super::*shared::check as shared_check\n---\n# use_both\n> local_check\n> shared_check\n---\n> use_both\n").unwrap();
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::Build)
+            .analyze(id(path("sub::consumer"), "use_both"));
+        assert!(!result.has_errors(), "{:?}", result.diagnostics());
+        assert_eq!(result.jar_paths().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证包根 self 留在包内且 super 不能越过包根。
+    #[test]
+    fn package_root_anchors_cannot_escape_to_consumer() {
+        let root = fixture(&[(
+            "main.mf",
+            "> crate::*helper::check\n---\n# run\n> check\n---\n> run\n",
+        )]);
+        write_jar(
+            &root,
+            "helper.mjar",
+            "helper",
+            &[(
+                String::new(),
+                "> self::helper as h\n> super::outside::missing\n---\n# helper\n- internal\n# check\n> h\n---\n> helper\n> check\n",
+            )],
+        );
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::DryRun)
+            .analyze(id(ModulePath::root(), "run"));
+        assert!(
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "P015")
+        );
+        assert!(
+            !result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "P001")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // 验证导入方只能从包根 lib.mf 的公开区取目标。
+    #[test]
+    fn package_internal_public_targets_are_not_external_interface() {
+        let root = fixture(&[(
+            "main.mf",
+            "> crate::*helper::api\n> crate::helper::detail::leak\n---\n# run\n> api\n---\n> run\n",
+        )]);
+        write_jar(
+            &root,
+            "helper.mjar",
+            "helper",
+            &[
+                (
+                    String::new(),
+                    "> crate::detail::leak\n---\n# api\n> leak\n---\n> api\n",
+                ),
+                (
+                    "detail".to_owned(),
+                    "---\n# leak\n- internals\n---\n> leak\n",
+                ),
+            ],
+        );
+        let result = ProjectAnalyzer::new(root.join("main.mf"), AnalysisMode::DryRun)
+            .analyze(id(ModulePath::root(), "run"));
+        assert!(
+            result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "P009"
+                    && diagnostic.message().contains("not exported"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

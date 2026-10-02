@@ -44,7 +44,7 @@ cargo install makedown-cli --locked
 
 顶部三行的 `super::` 是一种文件路径写法：`super` 指向当前文件的上一级目录，连续的 `::` 表示继续进入下级文件。例如 `super::quality::gate::approve` 表示从上一级目录的 `quality/gate.mf` 文件导入名为 `approve` 的目标，并把它以自己的名字 `approve` 引入本文件——正文的前置目标因此可以直接写短名。`>` 出现在文件顶部是导入，出现在标题下方则是前置目标。类似的前缀还有 `crate::`（从项目入口文件出发）和 `self::`（从当前文件所在目录出发）。被导入的目标必须先在自己的文件中用底部的 `>` 声明公开，否则会报告私有目标错误。
 
-项目可以由多份这样的文件组成，入口文件默认为 `main.mf`。更多由简单到复杂的完整例子见[示例项目](examples/README.md)。
+项目可以由多份这样的文件组成。应用型项目入口为 `main.mf`，包型项目入口为 `lib.mf`；应用型默认把 Markfile 收进 `.mkd/`。更多由简单到复杂的完整例子见[示例项目](examples/README.md)。
 
 ## 先运行一个示例
 
@@ -57,7 +57,7 @@ mkd target greet --root examples/valid/01-single-target/main.mf -o greeting-plan
 
 第一条命令检查工作说明，不写文件。第二条命令在仓库根目录生成 `greeting-plan.md`。打开它可以看到 `greet` 目标的工作说明和验收条目。如果不想在仓库里留下输出文件，把路径换成其他临时位置即可，例如 `/tmp/greeting-plan.md`（Windows 可用 `%TEMP%\greeting-plan.md`）。
 
-这里的 `target greet` 表示从名为 `greet` 的目标开始生成计划。`--root` 指定该示例项目的入口文件；在自己的项目中，工具会从当前目录向上寻找最近的 `main.mf`。
+这里的 `target greet` 表示从名为 `greet` 的目标开始生成计划。`--root` 指定该示例项目的入口文件；在自己的项目中，工具会从当前目录向上寻找最近的平铺或 `.mkd/` 入口文件。
 
 ## 写一份自己的工作说明
 
@@ -69,7 +69,7 @@ cd my-project
 mkd build
 ```
 
-工具会在 `my-project` 中创建入口文件 `main.mf` 和构建设置 `mkd.toml`，同时运行 `git init` 初始化 Git 仓库，再将实施计划写入 `dist/plan.md`。新项目中的目标叫 `start`。完整的初始化方式和配置写法见[项目配置说明](docs/config.md)。
+工具会在 `my-project/.mkd/` 创建 `main.mf`，在外层创建 `mkd.toml`，同时运行 `git init`，再将实施计划写入外层的 `dist/plan.md`。`mkd init --flat` 保留平铺目录方式；`mkd init --lib` 创建可打包的平铺 `lib.mf` 项目。新项目中的目标叫 `start`。完整的初始化方式和配置写法见[项目配置说明](docs/config.md)。
 
 `mkd init` 创建的 `main.mf` 同样由上述三个区域组成，只是顶部导入区为空，文件以 `---` 开头。把示例文字改成自己的工作内容，再按同样的方式添加前置目标即可。
 
@@ -77,7 +77,11 @@ mkd build
 
 `mkd target start -o plan.md` 直接为 `start` 目标生成计划，并把文件写入 `plan.md`。需要先检查而暂不写文件时，使用 `mkd target start --check`。这里的 `-o` 指定输出文件；`target` 后还可以写带模块路径的目标名，例如 `catalog::publish`，表示 `catalog` 文件模块中的 `publish` 目标。命令行里的目标路径默认从入口文件算起，不需要写 `crate::` 前缀。
 
-若经常生成同一份计划，可以在 `mkd.toml` 里保存目标、输出路径和可选的排版模板。这组设置叫构建配方。`mkd build` 使用默认配方，`mkd build NAME` 使用指定名称的配方；`mkd target` 则直接按命令行给出的目标和输出文件运行。要检查单份文件，可用 `mkd lint main.mf`；要格式化它，可用 `mkd fmt main.mf`。
+若经常生成同一份计划，可以在 `mkd.toml` 里保存目标、输出路径和可选的排版模板。这组设置叫构建配方。`mkd build` 使用默认配方，`mkd build NAME` 使用指定名称的配方；`mkd target` 则直接按命令行给出的目标和输出文件运行。要检查单份文件，可用 `mkd lint .mkd/main.mf`；要格式化它，可用 `mkd fmt .mkd/main.mf`（平铺项目直接用 `main.mf`）。
+
+## 打包与导入
+
+以 `lib.mf` 为根的项目可以运行 `mkd pack`，得到 `dist/<项目名>.mjar`。它是保留模块结构的压缩包，公开接口来自 `lib.mf` 的公开区。将它复制到另一项目的 `.mkd/vendor/utils.mjar`，在 Markfile 顶部写 `> crate::vendor::*utils::目标 as 别名` 即可导入；`*utils` 与普通 `utils.mf` 的引用有明确区分。打包时会展开已经导入的包，没有嵌套包，也不隐藏规格原文。`mkd lock` 可记录所引用包的 SHA-256；锁内已有记录的哈希若变化，后续构建报错。用 `mkd graph --jar dist/<项目名>.mjar` 可独立查看包图。详见[包与锁说明](docs/config.md#分发-mjar-包与哈希锁)。
 
 ## 在终端查看依赖图
 
@@ -91,6 +95,7 @@ mkd graph --charset ascii --color never       # 适合纯文本日志
 mkd graph --interactive                       # 按模块浏览，选择 Target 查看详情
 mkd graph --image project.svg                 # 直接导出 SVG 图片
 mkd graph --format dot -o project.dot         # 导出 Graphviz DOT
+mkd graph --jar dist/example.mjar             # 直接查看包图
 ```
 
 交互模式以 Module 为页面、以 Target 为焦点：每页显示当前模块的全部 Target，以及它们直接依赖的外部 Target；外部节点的依赖在进入对应模块后才展开。按 `h/j/k/l` 或方向键选择相应方向的 Target，选中节点高亮，视框以焦点居中为基准；`Tab` / `Shift-Tab` 可依次选择节点。`Shift+H/J/K/L`（大写 `H/J/K/L`，也支持 Shift+方向键）按一格调整相对观察位置：H 向左、J 向下、K 向上、L 向右，图向相反方向移动。偏移在选择 Target、切换模块及返回时保留，顶部显示当前偏移；范围受视框大小限制，并尽量保持焦点可见。图边缘可以留白，让边缘 Target 也能居中。
@@ -101,9 +106,9 @@ mkd graph --format dot -o project.dot         # 导出 Graphviz DOT
 
 浮窗关闭时，`Esc` / `Backspace` 返回上一个模块及焦点；`[` / `]` 切换上一个/下一个模块，也可访问没有依赖连线的模块。`mkd graph platform::launch --interactive` 从该 Target 所在模块开始，并选中它。按 `e` 将**当前模块局部图**（不含高亮和浮窗）导出为项目根目录下的 `graph.svg`，按 `Ctrl-C` 退出。可用 `mkd graph --interactive --image dist/project.svg` 为 `e` 指定其他导出位置。
 
-`--image [FILE]` 使用内置导出器直接生成带主题色的矢量 SVG，不要求安装 Graphviz；省略 `FILE` 时写入入口 Markfile 旁的 `graph.svg`，相对路径也以项目根目录为起点。`--direction` 还接受 `bottom-up` 和 `right-left`。DOT 文件仍可继续用 Graphviz 转换成其他格式，例如 `dot -Tpng project.dot -o project.png`。当前图命令只渲染分析成功的项目；若存在语法、引用或依赖环错误，会像其他项目命令一样输出诊断并返回失败。
+`--image [FILE]` 使用内置导出器直接生成带主题色的矢量 SVG，不要求安装 Graphviz；省略 `FILE` 时写入配置目录下的 `graph.svg`（`--jar` 则写在包旁），相对路径也以该目录为起点。`--direction` 还接受 `bottom-up` 和 `right-left`。DOT 文件仍可继续用 Graphviz 转换成其他格式，例如 `dot -Tpng project.dot -o project.png`。当前图命令只渲染分析成功的项目；若存在语法、引用或依赖环错误，会像其他项目命令一样输出诊断并返回失败。
 
-完成一轮工作后可运行 `mkd archive`。它会从项目根目录暂存全部新增、修改和删除，再创建 Git 提交。提交消息由概括数量的主题行和按动作分组的 Target 清单组成，例如：
+完成一轮工作后可运行 `mkd archive`。平铺布局暂存整个项目目录；隐藏布局只暂存 `.mkd/`、`mkd.toml` 和已有的 `mkd.lock`，不会顺带提交宿主源码。提交消息由概括数量的主题行和按动作分组的 Target 清单组成，例如：
 
 ```text
 Archive targets: add 2, update 1, remove 1

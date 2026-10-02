@@ -958,6 +958,12 @@ fn archive_in_hidden_layout_commits_only_markdown_scope() {
         String::from_utf8(message.stdout).unwrap().trim(),
         "Archive targets: add 1, remove 1\n\nAdd:\n- launch\n\nRemove:\n- start"
     );
+    fs::write(directory.join("mkd.lock"), "version = 1\njar = []\n").unwrap();
+    assert!(run(&directory, &["archive"]).status.success());
+    fs::remove_file(directory.join("mkd.lock")).unwrap();
+    let deleted = run(&directory, &["archive"]);
+    assert!(deleted.status.success(), "{deleted:?}");
+    assert!(!String::from_utf8_lossy(&git(&directory, &["ls-files"]).stdout).contains("mkd.lock"));
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1027,6 +1033,93 @@ fn pack_then_import_into_hidden_application() {
     let plan = fs::read_to_string(app.join("dist/plan.md")).unwrap();
     assert!(plan.contains("Internal specification."));
     assert!(plan.contains("Public specification."));
+    fs::remove_dir_all(root).unwrap();
+}
+
+// --jar 无需本地项目，即可对包渲染终端、DOT 与 SVG 图。
+#[test]
+fn graph_jar_renders_standalone_package() {
+    let root = temporary_directory();
+    let library = root.join("library");
+    assert!(run(&root, &["init", "--lib", "library"]).status.success());
+    let packed = run(&library, &["pack"]);
+    assert!(packed.status.success(), "{packed:?}");
+    let jar = library.join("dist/library.mjar");
+    let jar_arg = jar.to_str().unwrap();
+    let terminal = run(&root, &["graph", "--jar", jar_arg]);
+    assert!(terminal.status.success(), "{terminal:?}");
+    assert!(String::from_utf8_lossy(&terminal.stdout).contains("start"));
+    let dot = run(&root, &["graph", "--jar", jar_arg, "--format", "dot"]);
+    assert!(dot.status.success(), "{dot:?}");
+    assert!(String::from_utf8_lossy(&dot.stdout).contains("digraph"));
+    let svg = run(&root, &["graph", "--jar", jar_arg, "--image", "graph.svg"]);
+    assert!(svg.status.success(), "{svg:?}");
+    assert!(
+        fs::read_to_string(library.join("dist/graph.svg"))
+            .unwrap()
+            .contains("<svg")
+    );
+    let blocked = run(&root, &["graph", "--jar", jar_arg, "-o", jar_arg]);
+    assert!(!blocked.status.success());
+    assert!(jar.is_file());
+    let corrupt = root.join("broken.mjar");
+    fs::write(&corrupt, "not a zip").unwrap();
+    let invalid = run(&root, &["graph", "--jar", corrupt.to_str().unwrap()]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("cannot analyze package"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+// 锁定包后哈希不符阻断构建，重新 lock 后可继续构建。
+#[test]
+fn lock_detects_changed_package_and_can_refresh() {
+    let root = temporary_directory();
+    let library = root.join("library");
+    let app = root.join("app");
+    assert!(run(&root, &["init", "--lib", "library"]).status.success());
+    fs::write(library.join("lib.mf"), "---\n# api\nInitial.\n---\n> api\n").unwrap();
+    assert!(run(&library, &["pack"]).status.success());
+    assert!(run(&root, &["init", "app"]).status.success());
+    fs::create_dir_all(app.join(".mkd/vendor")).unwrap();
+    let installed = app.join(".mkd/vendor/library.mjar");
+    fs::copy(library.join("dist/library.mjar"), &installed).unwrap();
+    fs::write(
+        app.join(".mkd/main.mf"),
+        "> crate::vendor::*library::api as imported\n---\n# start\n> imported\n---\n> start\n",
+    )
+    .unwrap();
+    assert!(run(&app, &["build"]).status.success());
+    let locked = run(&app, &["lock"]);
+    assert!(locked.status.success(), "{locked:?}");
+    let lock = fs::read_to_string(app.join("mkd.lock")).unwrap();
+    assert!(lock.contains(".mkd/vendor/library.mjar"));
+    assert!(lock.contains("sha256:"));
+    fs::write(library.join("lib.mf"), "---\n# api\nUpdated.\n---\n> api\n").unwrap();
+    assert!(run(&library, &["pack"]).status.success());
+    fs::copy(library.join("dist/library.mjar"), &installed).unwrap();
+    let mismatch = run(&app, &["build"]);
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("hash mismatch"));
+    assert!(run(&app, &["lock"]).status.success());
+    assert!(run(&app, &["build"]).status.success());
+    assert!(
+        fs::read_to_string(app.join("dist/plan.md"))
+            .unwrap()
+            .contains("Updated.")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+// init 不创建会被现有入口遮蔽的第二套布局。
+#[test]
+fn init_rejects_competing_roots() {
+    let root = temporary_directory();
+    fs::write(root.join("main.mf"), "---\n# start\n---\n> start\n").unwrap();
+    let conflict = run(&root, &["init"]);
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("competing project root"));
+    assert!(!root.join(".mkd").exists());
+    assert!(!run(&root, &["init", "--lib"]).status.success());
     fs::remove_dir_all(root).unwrap();
 }
 

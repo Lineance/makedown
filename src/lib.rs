@@ -15,6 +15,8 @@ pub mod graph;
 mod interactive;
 /// 提供文件与项目静态检查能力。
 pub mod linter;
+/// 提供 .mjar 的可选哈希锁定能力。
+pub mod lock;
 /// 提供可复用的 Cargo 风格日志接口。
 pub mod logging;
 /// 提供编辑器中的单文件诊断与格式化服务。

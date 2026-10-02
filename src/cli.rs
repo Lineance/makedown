@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::archive::{ArchiveError, archive_project, initialize_repository};
+use crate::archive::{ArchiveError, archive_project, initialize_repository, is_tracked};
 use crate::compiler::{CompileError, Compiler, DefaultMarkdownRenderer, TemplateMarkdownRenderer};
 use crate::config::{ConfigError, ProjectConfig, project_path};
 use crate::core::{ModulePath, ModulePathError, Project, TargetId, TargetName};
@@ -135,6 +135,8 @@ enum Command {
     },
     #[command(about = "Stage all project changes and commit them with an inferred message")]
     Archive,
+    #[command(about = "Freeze hashes of all imported .mjar packages in mkd.lock")]
+    Lock,
     #[command(about = "Pack a lib.mf project into a distributable .mjar")]
     Pack {
         #[arg(
@@ -147,6 +149,8 @@ enum Command {
     },
     #[command(about = "Visualize the project Target dependency graph")]
     Graph {
+        #[arg(long, value_name = "FILE", help = "Render a standalone .mjar package")]
+        jar: Option<PathBuf>,
         #[arg(
             value_name = "TARGET",
             help = "Show TARGET and prerequisites; in interactive mode, select TARGET in its module"
@@ -277,7 +281,9 @@ enum CliError {
     ProfileUnavailable(String),
     Init(String),
     Archive(ArchiveError),
+    Lock(String),
     Pack(PackError),
+    Jar(String),
     Graph(GraphRenderError),
     InteractiveTerminalRequired,
     InteractiveFormat,
@@ -353,7 +359,9 @@ impl fmt::Display for CliError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::ProfileUnavailable(message) | Self::Init(message) => formatter.write_str(message),
             Self::Archive(error) => write!(formatter, "archive failed: {error}"),
+            Self::Lock(message) => write!(formatter, "lock failed: {message}"),
             Self::Pack(error) => write!(formatter, "pack failed: {error}"),
+            Self::Jar(message) => write!(formatter, "cannot analyze package: {message}"),
             Self::Graph(error) => write!(formatter, "graph rendering failed: {error}"),
             Self::InteractiveTerminalRequired => formatter
                 .write_str("interactive graph mode requires both stdin and stdout to be terminals"),
@@ -469,11 +477,13 @@ fn execute(
                 .and_then(|parent| parent.file_name())
                 .is_some_and(|name| name == std::ffi::OsStr::new(".mkd"));
             let scopes: Vec<String> = if hidden {
-                [".mkd", "mkd.toml", "mkd.lock"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .filter(|scope| config_dir.join(scope).exists())
-                    .collect()
+                let mut scopes = vec![".mkd".to_owned(), "mkd.toml".to_owned()];
+                if config_dir.join("mkd.lock").exists()
+                    || is_tracked(&config_dir, Path::new("mkd.lock")).map_err(CliError::Archive)?
+                {
+                    scopes.push("mkd.lock".to_owned());
+                }
+                scopes
             } else {
                 vec![".".to_owned()]
             };
@@ -489,6 +499,33 @@ fn execute(
             logger
                 .finished(
                     &format!("archived project with `{subject}`"),
+                    started.elapsed(),
+                )
+                .map_err(CliError::WriteDiagnostics)
+        }
+        Command::Lock => {
+            let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
+            let analysis = ProjectAnalyzer::new(&root_file, AnalysisMode::Build)
+                .without_lock_verification()
+                .analyze_all_with_progress(|module| logger.parsing(module))
+                .map_err(CliError::WriteDiagnostics)?;
+            for diagnostic in analysis.diagnostics() {
+                logger
+                    .diagnostic(diagnostic)
+                    .map_err(CliError::WriteDiagnostics)?;
+            }
+            if analysis.has_errors() {
+                return Err(CliError::AnalysisFailed);
+            }
+            let path = crate::lock::write_lock(&root_file, analysis.jar_paths())
+                .map_err(CliError::Lock)?;
+            logger
+                .finished(
+                    &format!(
+                        "locked {} packages in `{}`",
+                        analysis.jar_paths().len(),
+                        path.display()
+                    ),
                     started.elapsed(),
                 )
                 .map_err(CliError::WriteDiagnostics)
@@ -526,6 +563,7 @@ fn execute(
             }
         }
         Command::Graph {
+            jar,
             target,
             format,
             direction,
@@ -543,12 +581,24 @@ fn execute(
             if interactive && !interactive::terminal_available() {
                 return Err(CliError::InteractiveTerminalRequired);
             }
-            let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
+            if jar.is_some() && cli.root.is_some() {
+                return Err(CliError::InvalidArguments);
+            }
+            let jar = jar.map(|path| resolve_from(current_directory, &path));
+            let root_file = match &jar {
+                Some(path) => path.clone(),
+                None => resolve_root_file(cli.root.as_deref(), current_directory)?,
+            };
             let target = target.as_deref().map(parse_target_id).transpose()?;
             let output = output.map(|path| resolve_from(current_directory, &path));
             let image = image.map(|path| {
                 if path.is_absolute() {
                     path
+                } else if jar.is_some() {
+                    root_file
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(path)
                 } else {
                     config_directory(&root_file).join(path)
                 }
@@ -559,6 +609,7 @@ fn execute(
             let color = format == GraphFormat::Terminal && cli.color.enabled(terminal_allows_color);
             execute_graph(
                 &root_file,
+                jar.is_some(),
                 target,
                 format,
                 direction.into(),
@@ -767,6 +818,7 @@ fn compile_target(
 #[allow(clippy::too_many_arguments)]
 fn execute_graph(
     root_file: &Path,
+    jar_mode: bool,
     target: Option<TargetId>,
     format: GraphFormat,
     direction: GraphDirection,
@@ -779,18 +831,24 @@ fn execute_graph(
     started: Instant,
 ) -> Result<(), CliError> {
     let analyzer = ProjectAnalyzer::new(root_file, AnalysisMode::Build);
-    let analysis = if interactive_mode {
-        // Target 在交互模式只决定初始焦点；模块切换仍需完整项目模型。
-        analyzer.analyze_all_with_progress(|module| logger.parsing(module))
+    let analysis = if jar_mode {
+        analyzer
+            .analyze_jar(root_file)
+            .map_err(|error| CliError::Jar(error.to_string()))?
     } else {
-        match &target {
-            Some(target) => {
-                analyzer.analyze_with_progress(target.clone(), |module| logger.parsing(module))
+        let result = if interactive_mode {
+            // Target 在交互模式只决定初始焦点；模块切换仍需完整项目模型。
+            analyzer.analyze_all_with_progress(|module| logger.parsing(module))
+        } else {
+            match &target {
+                Some(target) => {
+                    analyzer.analyze_with_progress(target.clone(), |module| logger.parsing(module))
+                }
+                None => analyzer.analyze_all_with_progress(|module| logger.parsing(module)),
             }
-            None => analyzer.analyze_all_with_progress(|module| logger.parsing(module)),
-        }
-    }
-    .map_err(CliError::WriteDiagnostics)?;
+        };
+        result.map_err(CliError::WriteDiagnostics)?
+    };
     for diagnostic in analysis.diagnostics() {
         logger
             .diagnostic(diagnostic)
@@ -810,12 +868,17 @@ fn execute_graph(
 
     if interactive_mode {
         let export_path = image.unwrap_or_else(|| {
-            root_file
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("graph.svg")
+            let directory = if jar_mode {
+                root_file
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            } else {
+                config_directory(root_file)
+            };
+            directory.join("graph.svg")
         });
-        prepare_graph_output(&export_path, root_file, &project, &jars)?;
+        prepare_graph_output(&export_path, root_file, &project, &jars, jar_mode)?;
         interactive::run(
             &project,
             &renderer,
@@ -831,7 +894,7 @@ fn execute_graph(
     }
 
     if let Some(path) = image {
-        prepare_graph_output(&path, root_file, &project, &jars)?;
+        prepare_graph_output(&path, root_file, &project, &jars, jar_mode)?;
         let svg = renderer
             .render_svg(&project, target.as_ref())
             .map_err(CliError::Graph)?;
@@ -854,7 +917,7 @@ fn execute_graph(
     .map_err(CliError::Graph)?;
 
     if let Some(path) = output {
-        prepare_graph_output(&path, root_file, &project, &jars)?;
+        prepare_graph_output(&path, root_file, &project, &jars, jar_mode)?;
         fs::write(&path, graph).map_err(|source| CliError::WriteOutput {
             path: path.clone(),
             source,
@@ -882,6 +945,7 @@ fn prepare_graph_output(
     root_file: &Path,
     project: &Project,
     jars: &[PathBuf],
+    jar_mode: bool,
 ) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::WriteOutput {
@@ -890,11 +954,12 @@ fn prepare_graph_output(
         })?;
     }
     if paths_alias(path, root_file)
-        || project_input_files(root_file, project)
-            .iter()
-            .any(|input| paths_alias(path, input))
+        || (!jar_mode
+            && project_input_files(root_file, project)
+                .iter()
+                .any(|input| paths_alias(path, input)))
         || jars.iter().any(|input| paths_alias(path, input))
-        || paths_alias(path, &config_directory(root_file).join("mkd.toml"))
+        || (!jar_mode && paths_alias(path, &config_directory(root_file).join("mkd.toml")))
     {
         return Err(CliError::OutputAliasesInput(path.to_path_buf()));
     }
@@ -948,6 +1013,15 @@ fn execute_init(
         .map(|path| resolve_from(current_directory, path))
         .unwrap_or_else(|| current_directory.to_path_buf());
     let root_file = layout.root_file(&directory);
+    for name in crate::project::ROOT_FILE_NAMES {
+        let other = directory.join(name);
+        if other != root_file && other.is_file() {
+            return Err(CliError::Init(format!(
+                "`{}` already exists; init will not create a competing project root",
+                other.display()
+            )));
+        }
+    }
     let config_file = directory.join("mkd.toml");
     let has_root = root_file.exists();
     let has_config = config_file.exists();
@@ -1214,6 +1288,7 @@ fn execute_maintenance(
         | Command::Build { .. }
         | Command::Init { .. }
         | Command::Archive
+        | Command::Lock
         | Command::Pack { .. }
         | Command::Graph { .. } => {
             return Err(CliError::InvalidArguments);

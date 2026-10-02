@@ -200,6 +200,7 @@ impl fmt::Display for TargetId {
 // 判断分段能否安全映射为项目内路径。
 fn is_valid_path_segment(segment: &str) -> bool {
     !segment.is_empty()
+        && !segment.starts_with('*')
         && segment != "."
         && segment != ".."
         && !segment.chars().any(|character| {
@@ -565,7 +566,7 @@ mod tests {
             ModulePath::parse("catalog::../secret"),
             Err(ModulePathError::InvalidSegment("../secret".to_owned()))
         );
-        for invalid in ["api`docs", "api\0docs"] {
+        for invalid in ["api`docs", "api\0docs", "*package"] {
             assert_eq!(
                 ModulePath::parse(invalid),
                 Err(ModulePathError::InvalidSegment(invalid.to_owned()))

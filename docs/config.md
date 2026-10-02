@@ -9,7 +9,7 @@ mkd init
 mkd build
 ```
 
-在当前目录创建项目时，第一条命令创建 `main.mf` 和 `mkd.toml`，并执行 `git init` 初始化 Git 仓库（已有仓库可安全复用）。`main.mf` 是项目的入口工作说明文件，`mkd.toml` 保存常用的构建设置。第二条命令读取设置，生成 `dist/plan.md`；打开这个文件就能看到实施计划。如果想让工具新建一个项目目录，可以改用以下步骤：
+在当前目录创建应用型项目时，第一条命令创建 `.mkd/main.mf` 和外层的 `mkd.toml`，并执行 `git init` 初始化或复用 Git 仓库。`.mkd/` 收纳全部 Markfile 模块，不占用编程项目根目录；`mkd.toml` 保存构建设置。第二条命令生成外层 `dist/plan.md`。如果想让工具新建一个项目目录，可以改用以下步骤：
 
 ```sh
 mkd init my-project
@@ -27,11 +27,11 @@ mkd build
 
 ## 项目根目录和初始化
 
-运行 `mkd build` 或 `mkd target` 时，工具默认从当前目录向上寻找最近的 `main.mf`，并以该文件所在目录作为项目根目录。例如从 `my-project/notes` 目录运行 `mkd build`，如果 `my-project/main.mf` 是最近的入口文件，就会使用 `my-project/mkd.toml`。若入口文件另有名字，可通过 `--root` 指定它。例如，在 `my-project` 目录里使用 `mkd build --root entry.mf`。构建配方仍从所选入口文件旁边的 `mkd.toml` 读取。
+`mkd` 从当前目录向上寻找最近的项目入口；同一目录按 `main.mf`、`lib.mf`、`.mkd/main.mf`、`.mkd/lib.mf` 顺序选择。平铺项目的模块与配置都在入口文件旁；隐藏项目的模块位于 `.mkd/`，`mkd.toml`、`mkd.lock` 和默认产物位于其外层。`crate::` 始终锚定模块目录。可用 `--root FILE` 显式指定入口，隐藏布局的配置仍在外层。
 
-运行 `mkd init` 时，新项目默认创建名为 `start` 的本地目标，以及名为 `main` 的默认配方。可以用 `mkd init --target launch` 给新目标指定名称，也可以用 `mkd init my-project --target launch` 在指定目录创建它。这里的“本地”表示目标就在新建的 `main.mf` 里。
+`mkd init` 默认创建 `.mkd/main.mf`；`mkd init --flat` 创建平铺的 `main.mf`（适合纯规划项目）；`mkd init --lib` 创建平铺的 `lib.mf`（可打包的库项目）。三者都创建 `mkd.toml`、名为 `start` 的公开目标和默认配方。可指定目录与 `--target launch` 自定义初始目标。
 
-如果某个目录里已有 `main.mf`，但尚无 `mkd.toml`，先确认入口文件中确实有 `launch` 目标，再在该目录运行 `mkd init --target launch`。工具会检查该目标能否成功分析，为它创建配置，并保留原有的 `main.mf`。已有 `mkd.toml` 时，初始化会报错，以免覆盖配置。若 Git 初始化失败，本次新建的 `main.mf` 和 `mkd.toml` 会被清理，已有的 `main.mf` 则保持不变。
+若入口文件已存在但没有 `mkd.toml`，用对应布局的 init 参数和 `--target launch` 创建配置，例如已有平铺 `main.mf` 时运行 `mkd init --flat --target launch`；已有 `.mkd/main.mf` 时运行 `mkd init --target launch`。工具会验证目标、保留原文件，不覆盖已有配置。
 
 ## 编写 mkd.toml
 
@@ -57,7 +57,35 @@ output = "dist/guide.md"
 
 `platform::launch` 表示 `platform` 模块文件中的 `launch` 目标；`content::guide::publish` 表示更深一层模块中的 `publish` 目标。模块可以理解为项目中的另一份 `.mf` 文件，用来分组保存目标。入口文件 `main.mf` 中的目标只需写本地名称，例如 `start`。文件组织和跨文件引用的实例可以从 [`examples/`](../examples/README.md) 开始查看。
 
-上述 `release` 配方会把文件写到项目目录内的 `dist/release.md`，并用 `templates/release.md.j2` 排版；`guide` 配方会使用内置排版，写到 `dist/guide.md`。这些文件路径以项目根目录为起点。配置中的路径只能指向项目内部，不能是绝对路径，也不能通过上一级路径或符号链接指向项目外部。`mkd` 会检查配置格式、目标名称和路径；只写 `version = 1` 也能得到有效的空配置，但要执行 `mkd build`，还需要配方。
+上述 `release` 配方会把文件写到项目目录内的 `dist/release.md`，并用 `templates/release.md.j2` 排版；`guide` 配方会使用内置排版，写到 `dist/guide.md`。这些文件路径以 `mkd.toml` 所在目录为起点（隐藏布局即 `.mkd/` 的外层）。配置中的路径只能指向项目内部，不能是绝对路径，也不能通过上一级路径或符号链接指向项目外部。`mkd` 会检查配置格式、目标名称和路径；只写 `version = 1` 也能得到有效的空配置，但要执行 `mkd build`，还需要配方。
+
+## 分发 .mjar 包与哈希锁
+
+包项目使用 `lib.mf` 作为根，其**公开区**（第二个 `---` 后的 `> 目标`）是包的入口接口：
+
+```sh
+mkd init --lib shared
+cd shared
+# 编辑 lib.mf 和其他 .mf 模块
+mkd pack                        # dist/shared.mjar
+mkd graph --jar dist/shared.mjar # 不必身处项目中也能查看包图
+```
+
+在应用项目中将包复制到 `.mkd/vendor/shared.mjar`（平铺项目为 `vendor/shared.mjar`），在 `main.mf` 导入：
+
+```mf
+> crate::vendor::*shared::start as shared_start
+---
+# start
+> shared_start
+完成应用目标。
+---
+> start
+```
+
+`*shared` 明确选择 `shared.mjar`，普通 `shared` 仍选择 `shared.mf`；同名包与模块不能占用同一命名空间。包内 `crate::` 指向包自身，`self`/`super` 保持相对含义。只能从外部导入包的 `lib.mf` 公开目标；包保留依赖模块和规格原文，分发等同开源，也不能阻止规格文本中的提示词注入。`mkd pack -o FILE` 可指定输出；打包从公开目标出发按模块剪枝，并将已导入包**展开**，产物内不嵌套 `.mjar`，写出后自校验。
+
+运行 `mkd lock` 遍历项目模块中的包导入，生成配置目录下的 `mkd.lock`（路径与 SHA-256 哈希）。之后分析/构建时，**已记录**的包哈希不符会报错；没有锁文件或新增包尚未记录时仍可构建。更新包后重新运行 `mkd lock`。由于打包会展开依赖包，锁记录项目直接引用的 `.mjar` 文件；锁定的是字节内容，不是版本号。
 
 ## 查看 Target 依赖图
 
@@ -85,13 +113,13 @@ mkd graph --format dot -o dist/project.dot
 - 浮窗关闭时 `Esc` / `Backspace` 返回上一个模块及焦点；`[` / `]` 切换上一个/下一个模块，可访问孤立模块。
 - `e` 导出当前模块局部图，不包含焦点高亮或浮窗；`Ctrl-C` 退出。
 
-例如 A 模块的 Target 依赖 `B::four`，`B::four` 又依赖 `C::five`：A 页只显示 `B::four`，选中它并按 `Enter` 进入 B 页后才显示 `C::five`。默认导出路径是入口 Markfile 旁的 `graph.svg`，`--interactive --image dist/project.svg` 可以改变热键的导出路径。交互模式要求标准输入和标准输出都连接终端。
+例如 A 模块的 Target 依赖 `B::four`，`B::four` 又依赖 `C::five`：A 页只显示 `B::four`，选中它并按 `Enter` 进入 B 页后才显示 `C::five`。默认导出路径是配置目录下的 `graph.svg`，`--interactive --image dist/project.svg` 可以改变热键的导出路径。交互模式要求标准输入和标准输出都连接终端。
 
-`--image [FILE]` 用内置导出器生成带配色的独立 SVG 图片，不需要 Graphviz；省略文件名时使用 `graph.svg`，相对路径以项目根目录为起点。SVG 按终端格为每个字符指定横坐标，避免字体自然字距导致线条与标签错位；中文双宽字符预留两格。组合符等零宽字符保留原字符，并补足内部画布占位格以保持后续列位置。`--format dot` 则输出 Graphviz DOT，可交给 `dot -Tpng` 等命令继续处理。`-o/--output` 写入终端文本或 DOT 文件，否则写入标准输出；自动颜色仅在直接输出到终端时启用。图命令要求项目分析成功，语法、引用或依赖环错误会阻止绘图并返回诊断。
+`--image [FILE]` 用内置导出器生成带配色的独立 SVG 图片，不需要 Graphviz；省略文件名时使用 `graph.svg`，相对路径以配置目录为起点（`--jar` 时以包所在目录为起点）。SVG 按终端格为每个字符指定横坐标，避免字体自然字距导致线条与标签错位；中文双宽字符预留两格。组合符等零宽字符保留原字符，并补足内部画布占位格以保持后续列位置。`--format dot` 则输出 Graphviz DOT，可交给 `dot -Tpng` 等命令继续处理。`-o/--output` 写入终端文本或 DOT 文件，否则写入标准输出；自动颜色仅在直接输出到终端时启用。图命令要求项目分析成功，语法、引用或依赖环错误会阻止绘图并返回诊断。
 
 ## 归档项目变化
 
-运行 `mkd archive` 会以 `main.mf` 所在目录为项目根目录，暂存该目录下的全部新增、修改和删除，并创建一次 Git 提交。它等价于先在项目根目录执行 `git add --all -- .`，再使用自动推断的提交消息执行提交；因此不会顺带提交同一上级仓库中项目目录之外的文件。从项目的子目录运行时，`mkd` 仍会先向上找到最近的 `main.mf`。
+运行 `mkd archive` 时，平铺项目暂存整个项目目录；隐藏布局仅暂存 `.mkd/`、`mkd.toml` 和已有的 `mkd.lock`，不会提交宿主项目的源码，并创建一次 Git 提交。平铺项目等价于在配置目录执行 `git add --all -- .`；隐藏布局按上述文件范围提交。从子目录运行时，`mkd` 同样向上查找最近的入口。
 
 提交消息由概括数量的主题行和分组清单组成，Target 按名称排序：
 
@@ -132,9 +160,12 @@ mkd graph platform::launch                 # 在终端查看目标及其前置�
 mkd graph --interactive                    # 按模块浏览 Target 和详情浮窗
 mkd graph --image dist/project.svg         # 直接导出全项目 SVG 图片
 mkd graph --format dot -o dist/project.dot # 导出全项目 Graphviz DOT
+mkd graph --jar dist/shared.mjar          # 查看独立包图
+mkd pack                                  # 打包 lib.mf 项目
+mkd lock                                  # 冻结被引用包的 SHA-256
 mkd archive                                # 暂存全部项目变化并创建自动命名的提交
 ```
 
 `mkd build --template alternate.md.j2` 可在本次构建中改用另一个排版模板；`mkd target start --template alternate.md.j2 -o plan.md` 也可以直接指定模板。模板的写法见[自定义 Markdown 模板](templates.md)。命令行中的 `-o` 和 `--template` 接受绝对路径；写相对路径时，以运行命令时所在的目录为起点。配置文件中的 `output` 和 `template` 则只能写项目内部的相对路径。`--check` 只检查，不创建输出文件或目录；当前配方使用了模板时，还会尝试用实际计划渲染它。
 
-生成计划时，工具会为输出文件创建所需的父目录。为了保护输入内容，输出不能覆盖入口 `.mf`、构建时读取的其他 `.mf`、正在使用的模板或 `mkd.toml`。检查单份文件可以使用 `mkd lint main.mf`，检查项目中的所有 Markfile 可以使用 `mkd lint --all`；格式化文件使用 `mkd fmt main.mf`。这些维护命令不需要构建配方。
+生成计划时，工具会为输出文件创建所需的父目录。为了保护输入内容，输出不能覆盖入口 `.mf`、构建时读取的其他 `.mf`、正在使用的模板或 `mkd.toml`。检查单份文件可以使用 `mkd lint .mkd/main.mf`（平铺布局直接使用 `main.mf`），检查整个项目用 `mkd lint --all`；格式化文件使用 `mkd fmt .mkd/main.mf`。这些维护命令不需要构建配方。

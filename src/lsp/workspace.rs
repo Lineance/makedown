@@ -12,9 +12,7 @@ use url::Url;
 
 use crate::core::{ModulePath, TargetId, TargetName};
 use crate::parser::{ParsedModule, ParsedReference};
-use crate::project::{
-    AnalysisDiagnostic, AnalysisMode, ProjectAnalyzer, ROOT_FILE_NAMES,
-};
+use crate::project::{AnalysisDiagnostic, AnalysisMode, ProjectAnalyzer, ROOT_FILE_NAMES};
 
 // 保存一次跨文件分析的诊断、语法模型与实际读取的源码。
 #[derive(Clone)]

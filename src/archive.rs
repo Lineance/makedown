@@ -48,8 +48,26 @@ pub fn initialize_repository(directory: &Path) -> Result<(), ArchiveError> {
     require_success("init", output).map(|_| ())
 }
 
+/// 判断路径是否已由仓库追踪，以便在文件被删除后仍能暂存删除。
+pub fn is_tracked(directory: &Path, path: &Path) -> Result<bool, ArchiveError> {
+    let output = run_git(
+        directory,
+        [
+            OsStr::new("ls-files"),
+            OsStr::new("--error-unmatch"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
+    )?;
+    Ok(output.status.success())
+}
+
 /// 暂存指定范围内的全部变化，推断 Target 摘要并创建提交。
-pub fn archive_project(directory: &Path, scopes: &[&str], root_relative: &Path) -> Result<String, ArchiveError> {
+pub fn archive_project(
+    directory: &Path,
+    scopes: &[&str],
+    root_relative: &Path,
+) -> Result<String, ArchiveError> {
     let mut staged = vec![OsStr::new("add"), OsStr::new("--all"), OsStr::new("--")];
     staged.extend(scopes.iter().map(OsStr::new));
     require_success("add", run_git(directory, staged)?)?;

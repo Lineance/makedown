@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -56,10 +56,18 @@ impl fmt::Display for JarError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Open { path, source } => {
-                write!(formatter, "cannot open package `{}`: {source}", path.display())
+                write!(
+                    formatter,
+                    "cannot open package `{}`: {source}",
+                    path.display()
+                )
             }
             Self::Read { path, source } => {
-                write!(formatter, "cannot read package `{}`: {source}", path.display())
+                write!(
+                    formatter,
+                    "cannot read package `{}`: {source}",
+                    path.display()
+                )
             }
             Self::MissingManifest { path } => {
                 write!(
@@ -113,8 +121,7 @@ impl JarBuilder {
 
     /// 按命名空间写入一个模块。
     pub fn add_module(&mut self, namespace: &ModulePath, source: impl Into<String>) {
-        self.entries
-            .insert(module_entry(namespace), source.into());
+        self.entries.insert(module_entry(namespace), source.into());
     }
 
     /// 按包内相对路径写入一个条目。
@@ -132,7 +139,10 @@ impl JarBuilder {
             .map(|root| toml::Value::String(root.clone()).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("format = 1\nname = {}\ncrate_roots = [{roots}]\n", toml::Value::String(name.to_owned()))
+        format!(
+            "format = 1\nname = {}\ncrate_roots = [{roots}]\n",
+            toml::Value::String(name.to_owned())
+        )
     }
 
     /// 将包写到指定路径，使用固定时间戳与压缩。
@@ -155,10 +165,7 @@ impl JarBuilder {
                     .expect("the epoch of zip timestamps is valid"),
             );
         let mut entries = self.entries.clone();
-        entries.insert(
-            "manifest.toml".to_owned(),
-            self.manifest_source(),
-        );
+        entries.insert("manifest.toml".to_owned(), self.manifest_source());
         for (entry, source) in &entries {
             writer
                 .start_file(entry.as_str(), options)
@@ -173,17 +180,18 @@ impl JarBuilder {
                     source,
                 })?;
         }
-        writer
-            .finish()
-            .map_err(|source| JarError::Read {
-                path: path.to_owned(),
-                source: source.into(),
-            })?;
+        writer.finish().map_err(|source| JarError::Read {
+            path: path.to_owned(),
+            source: source.into(),
+        })?;
         Ok(())
     }
 }
 
 /// 提供对一个 .mjar 包的只读访问。
+const MAX_MODULE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+
 pub struct JarReader {
     path: PathBuf,
     archive: zip::ZipArchive<File>,
@@ -206,29 +214,81 @@ impl JarReader {
         })?;
         let manifest = read_manifest(&path, &mut archive)?;
         let mut modules = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut total = 0_u64;
         for index in 0..archive.len() {
-            let entry = archive
-                .by_index(index)
-                .map_err(|source| JarError::Read {
+            let entry = archive.by_index(index).map_err(|source| JarError::Read {
+                path: path.clone(),
+                source: source.into(),
+            })?;
+            if !entry.is_file() {
+                continue;
+            }
+            if !seen.insert(entry.name().to_owned()) {
+                return Err(JarError::InvalidManifest {
                     path: path.clone(),
-                    source: source.into(),
-                })?;
-            if !entry.is_file() || !entry.name().ends_with(".mf") {
+                    message: format!("duplicate entry `{}`", entry.name()),
+                });
+            }
+            total = total.saturating_add(entry.size());
+            if entry.size() > MAX_MODULE_BYTES || total > MAX_ARCHIVE_BYTES {
+                return Err(JarError::InvalidManifest {
+                    path: path.clone(),
+                    message: format!("package entry `{}` exceeds size limit", entry.name()),
+                });
+            }
+            if entry.name().ends_with(".mjar") {
+                return Err(JarError::InvalidManifest {
+                    path: path.clone(),
+                    message: "nested .mjar entry is not allowed".to_owned(),
+                });
+            }
+            if !entry.name().ends_with(".mf") {
                 continue;
             }
             match module_namespace(entry.name()) {
                 Some(namespace) => {
-                    if !modules.contains(&namespace) {
-                        modules.push(namespace);
+                    if modules.contains(&namespace) {
+                        return Err(JarError::InvalidManifest {
+                            path: path.clone(),
+                            message: format!("duplicate module `{namespace}`"),
+                        });
                     }
+                    modules.push(namespace);
                 }
-                None => return Err(JarError::InvalidManifest {
-                    path: path.clone(),
-                    message: format!("invalid module entry `{}`", entry.name()),
-                }),
+                None => {
+                    return Err(JarError::InvalidManifest {
+                        path: path.clone(),
+                        message: format!("invalid module entry `{}`", entry.name()),
+                    });
+                }
             }
         }
         modules.sort();
+        if !modules.contains(&ModulePath::root()) {
+            return Err(JarError::MissingModule {
+                path: path.clone(),
+                namespace: ModulePath::root(),
+            });
+        }
+        for root in &manifest.crate_roots {
+            let namespace = if root.is_empty() {
+                ModulePath::root()
+            } else {
+                module_namespace(&format!("{root}.mf")).ok_or_else(|| {
+                    JarError::InvalidManifest {
+                        path: path.clone(),
+                        message: format!("invalid crate root `{root}`"),
+                    }
+                })?
+            };
+            if !modules.contains(&namespace) {
+                return Err(JarError::InvalidManifest {
+                    path: path.clone(),
+                    message: format!("crate root `{root}` has no module"),
+                });
+            }
+        }
         Ok(Self {
             path,
             archive,
@@ -280,20 +340,32 @@ impl JarReader {
                 namespace: namespace.clone(),
             })?;
         let mut source = String::new();
-        file.read_to_string(&mut source).map_err(|source| JarError::Read {
-            path: self.path.clone(),
-            source,
-        })?;
+        file.read_to_string(&mut source)
+            .map_err(|source| JarError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
         Ok(source)
     }
 }
 
 // 读取并校验包内 manifest.toml。
-fn read_manifest(path: &Path, archive: &mut zip::ZipArchive<File>) -> Result<JarManifest, JarError> {
+fn read_manifest(
+    path: &Path,
+    archive: &mut zip::ZipArchive<File>,
+) -> Result<JarManifest, JarError> {
     let mut file = archive
         .by_name("manifest.toml")
-        .map_err(|_| JarError::MissingManifest { path: path.to_owned() })?;
+        .map_err(|_| JarError::MissingManifest {
+            path: path.to_owned(),
+        })?;
     let mut source = String::new();
+    if file.size() > MAX_MODULE_BYTES {
+        return Err(JarError::InvalidManifest {
+            path: path.to_owned(),
+            message: "manifest.toml exceeds size limit".to_owned(),
+        });
+    }
     file.read_to_string(&mut source)
         .map_err(|source| JarError::Read {
             path: path.to_owned(),
@@ -330,9 +402,9 @@ fn read_manifest(path: &Path, archive: &mut zip::ZipArchive<File>) -> Result<Jar
             .ok_or_else(|| invalid("crate_roots must be a list".into()))?
             .iter()
             .map(|root| {
-                root.as_str().map(str::to_owned).ok_or_else(|| {
-                    invalid("crate_roots entries must be strings".into())
-                })
+                root.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("crate_roots entries must be strings".into()))
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
@@ -348,12 +420,8 @@ fn module_namespace(entry: &str) -> Option<ModulePath> {
     if entry == "lib" {
         return Some(ModulePath::root());
     }
-    let segments = entry
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if segments.is_empty() || entry.starts_with('/') || entry.contains('\\') {
+    let segments = entry.split('/').map(str::to_owned).collect::<Vec<_>>();
+    if segments.iter().any(String::is_empty) || entry.contains('\\') {
         return None;
     }
     ModulePath::new(segments).ok()
@@ -375,10 +443,7 @@ mod tests {
     // 验证条目路径与相对命名空间互相映射。
     #[test]
     fn module_entries_map_to_namespaces_and_back() {
-        assert_eq!(
-            module_namespace("lib.mf").unwrap(),
-            ModulePath::root()
-        );
+        assert_eq!(module_namespace("lib.mf").unwrap(), ModulePath::root());
         assert_eq!(
             module_namespace("catalog/api.mf").unwrap(),
             ModulePath::parse("catalog::api").unwrap()
@@ -391,6 +456,30 @@ mod tests {
             module_entry(&ModulePath::parse("catalog::api").unwrap()),
             "catalog/api.mf"
         );
+    }
+
+    // 验证坏包缺少根模块或嵌套包时被拒绝。
+    #[test]
+    fn reader_rejects_missing_root_and_nested_jars() {
+        let root = std::env::temp_dir().join(format!("mkd-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut builder = JarBuilder::new();
+        builder.add_module(&ModulePath::parse("sub").unwrap(), "---\n# x\n---\n> x\n");
+        let missing = root.join("missing.mjar");
+        builder.write_to(&missing).unwrap();
+        assert!(matches!(
+            JarReader::open(&missing),
+            Err(JarError::MissingModule { .. })
+        ));
+        builder.add_module(&ModulePath::root(), "---\n# x\n---\n> x\n");
+        builder.add_entry("nested.mjar", "not allowed");
+        let nested = root.join("nested.mjar");
+        builder.write_to(&nested).unwrap();
+        assert!(matches!(
+            JarReader::open(&nested),
+            Err(JarError::InvalidManifest { .. })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // 验证包写出与读回保留模块与清单，且写出结果确定性。
@@ -408,15 +497,24 @@ mod tests {
         let mut reader = JarReader::open(&first).unwrap();
         assert_eq!(reader.manifest().name(), "utils");
         assert_eq!(reader.manifest().crate_roots(), &["".to_owned()]);
-        assert_eq!(reader.crate_root_namespaces().unwrap(), vec![ModulePath::root()]);
+        assert_eq!(
+            reader.crate_root_namespaces().unwrap(),
+            vec![ModulePath::root()]
+        );
         assert!(reader.modules().contains(&ModulePath::root()));
-        assert!(reader.modules().contains(&ModulePath::parse("dep").unwrap()));
+        assert!(
+            reader
+                .modules()
+                .contains(&ModulePath::parse("dep").unwrap())
+        );
         assert_eq!(
             reader.read_module(&ModulePath::root()).unwrap(),
             "lib source"
         );
         assert_eq!(
-            reader.read_module(&ModulePath::parse("dep").unwrap()).unwrap(),
+            reader
+                .read_module(&ModulePath::parse("dep").unwrap())
+                .unwrap(),
             "dep source"
         );
         assert_eq!(

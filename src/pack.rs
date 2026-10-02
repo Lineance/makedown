@@ -126,6 +126,24 @@ pub fn pack_project(
     // 从公开接口出发收集可达模块，剪枝其余内容。
     let mut kept = reachable_modules(project);
     kept.insert(ModulePath::root());
+    // 已打包的依赖保持自身完整的模块树及所有内层 crate 根。
+    for mount in analysis.mounted_namespaces() {
+        if !kept
+            .iter()
+            .any(|namespace| namespace.segments().starts_with(mount.segments()))
+        {
+            continue;
+        }
+        let jar = analysis
+            .mount_path(mount)
+            .expect("mounted package has a path");
+        let reader = JarReader::open(jar).map_err(|error| PackError::Jar(error.to_string()))?;
+        for relative in reader.modules() {
+            let mut segments = mount.segments().to_vec();
+            segments.extend(relative.segments().iter().cloned());
+            kept.insert(ModulePath::new(segments).expect("validated namespaces remain valid"));
+        }
+    }
 
     // 产物不能覆盖任何输入文件，包括被剪枝的磁盘模块。
     if project.modules().any(|module| {
@@ -195,13 +213,19 @@ pub fn pack_project(
         builder.add_crate_root(root);
     }
 
+    // 先写入同目录临时文件，自校验成功后才原子替换正式产物。
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| PackError::Jar(format!("cannot create output directory: {error}")))?;
+    let staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| PackError::Jar(format!("cannot create temporary package: {error}")))?;
     builder
-        .write_to(output)
+        .write_to(staged.path())
         .map_err(|error| PackError::Jar(error.to_string()))?;
 
     // 自校验：产物作为独立项目完整加载并比对公开接口。
-    let verification = ProjectAnalyzer::new(output, AnalysisMode::Build)
-        .analyze_jar(output)
+    let verification = ProjectAnalyzer::new(staged.path(), AnalysisMode::Build)
+        .analyze_jar(staged.path())
         .map_err(|error| PackError::Jar(format!("cannot verify package: {error}")))?;
     if verification.has_errors() {
         return Err(PackError::Verification(verification.diagnostics().to_vec()));
@@ -222,6 +246,14 @@ pub fn pack_project(
             "package interface changed while packing: expected {interface} public targets, got {packed_interface}"
         )));
     }
+
+    staged.persist(output).map_err(|error| {
+        PackError::Jar(format!(
+            "cannot publish package `{}`: {}",
+            output.display(),
+            error.error
+        ))
+    })?;
 
     Ok(PackSummary {
         output: output.to_owned(),
