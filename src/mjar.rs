@@ -423,7 +423,7 @@ mod tests {
             std::fs::read(&first).unwrap(),
             std::fs::read(&second).unwrap()
         );
-        assert!(JarReader::open(&first.with_file_name("absent.mjar")).is_err());
+        assert!(JarReader::open(first.with_file_name("absent.mjar")).is_err());
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(second).unwrap();
     }

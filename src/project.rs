@@ -958,7 +958,7 @@ impl<'a> AnalysisState<'a> {
             .filter(|(mounted, _)| {
                 namespace
                     .segments()
-                    .starts_with(&mounted.segments()[..])
+                    .starts_with(mounted.segments())
             })
             .max_by_key(|(mounted, _)| mounted.segments().len());
         match mount {
@@ -974,7 +974,7 @@ impl<'a> AnalysisState<'a> {
     fn mount_of(&self, current: &ModulePath) -> Option<&ModulePath> {
         self.mounts
             .keys()
-            .find(|mounted| current.segments().starts_with(&mounted.segments()[..]))
+            .find(|mounted| current.segments().starts_with(mounted.segments()))
     }
 
     // 返回当前模块的 crate 锚点：包内模块锚定包自身的根。
@@ -982,7 +982,7 @@ impl<'a> AnalysisState<'a> {
         self.mounts
             .values()
             .flat_map(|mount| mount.crate_roots.iter())
-            .filter(|root| current.segments().starts_with(&root.segments()[..]))
+            .filter(|root| current.segments().starts_with(root.segments()))
             .max_by_key(|root| root.segments().len())
             .cloned()
             .unwrap_or_else(ModulePath::root)
