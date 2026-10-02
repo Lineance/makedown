@@ -19,8 +19,9 @@ pub mod linter;
 pub mod logging;
 /// 提供编辑器中的单文件诊断与格式化服务。
 pub mod lsp;
+pub mod mjar;
+pub mod pack;
 /// 提供单个 Markfile 的语法解析能力。
 pub mod parser;
 /// 提供项目加载、引用解析与图校验能力。
 pub mod project;
-pub mod mjar;

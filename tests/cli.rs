@@ -994,18 +994,62 @@ fn init_lib_creates_flat_package_project() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+// 从包项目打包后，在隐藏布局应用中导入并编译公开目标。
+#[test]
+fn pack_then_import_into_hidden_application() {
+    let root = temporary_directory();
+    let library = root.join("library");
+    let app = root.join("app");
+    assert!(run(&root, &["init", "--lib", "library"]).status.success());
+    fs::write(
+        library.join("lib.mf"),
+        "> crate::internal::ready\n---\n# api\n> ready\nPublic specification.\n---\n> api\n",
+    )
+    .unwrap();
+    fs::write(
+        library.join("internal.mf"),
+        "---\n# ready\nInternal specification.\n---\n> ready\n",
+    )
+    .unwrap();
+    let packed = run(&library, &["pack"]);
+    assert!(packed.status.success(), "{packed:?}");
+    assert!(run(&root, &["init", "app"]).status.success());
+    fs::create_dir_all(app.join(".mkd/vendor")).unwrap();
+    fs::copy(
+        library.join("dist/library.mjar"),
+        app.join(".mkd/vendor/library.mjar"),
+    )
+    .unwrap();
+    fs::write(app.join(".mkd/main.mf"),
+        "> crate::vendor::*library::api as imported\n---\n# start\n> imported\nApplication.\n---\n> start\n").unwrap();
+    let built = run(&app, &["build"]);
+    assert!(built.status.success(), "{built:?}");
+    let plan = fs::read_to_string(app.join("dist/plan.md")).unwrap();
+    assert!(plan.contains("Internal specification."));
+    assert!(plan.contains("Public specification."));
+    fs::remove_dir_all(root).unwrap();
+}
+
 // 验证同一目录内四种根的优先级与向上搜索。
 #[test]
 fn root_discovery_prefers_documented_order() {
     let directory = temporary_directory();
     fs::create_dir_all(directory.join("work")).unwrap();
     fs::create_dir_all(directory.join(".mkd")).unwrap();
-    fs::write(directory.join(".mkd/main.mf"), "---\n# hidden\n- hidden\n---\n> hidden\n").unwrap();
+    fs::write(
+        directory.join(".mkd/main.mf"),
+        "---\n# hidden\n- hidden\n---\n> hidden\n",
+    )
+    .unwrap();
     fs::write(directory.join("lib.mf"), "---\n# lib\n- lib\n---\n> lib\n").unwrap();
     let result = run(&directory.join("work"), &["target", "lib", "--check"]);
     assert!(result.status.success(), "{result:?}");
 
-    fs::write(directory.join("main.mf"), "---\n# flat\n- flat\n---\n> flat\n").unwrap();
+    fs::write(
+        directory.join("main.mf"),
+        "---\n# flat\n- flat\n---\n> flat\n",
+    )
+    .unwrap();
     let result = run(&directory.join("work"), &["target", "flat", "--check"]);
     assert!(result.status.success(), "{result:?}");
     let result = run(&directory.join("work"), &["target", "lib", "--check"]);

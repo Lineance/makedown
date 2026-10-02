@@ -18,10 +18,9 @@ use crate::graph::{GraphCharset, GraphDirection, GraphRenderError, ProjectGraphR
 use crate::interactive;
 use crate::linter::Linter;
 use crate::logging::{ColorChoice, Logger};
+use crate::pack::{PackError, pack_project};
 use crate::parser::{ParseMode, Parser as MarkfileParser};
-use crate::project::{
-    AnalysisMode, ProjectAnalyzer, config_directory, find_root_file,
-};
+use crate::project::{AnalysisMode, ProjectAnalyzer, config_directory, find_root_file};
 
 // 定义 mkd 的命令行参数。
 #[derive(Debug, Parser)]
@@ -136,6 +135,16 @@ enum Command {
     },
     #[command(about = "Stage all project changes and commit them with an inferred message")]
     Archive,
+    #[command(about = "Pack a lib.mf project into a distributable .mjar")]
+    Pack {
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            help = "Write the package to FILE instead of dist/<name>.mjar"
+        )]
+        output: Option<PathBuf>,
+    },
     #[command(about = "Visualize the project Target dependency graph")]
     Graph {
         #[arg(
@@ -268,6 +277,7 @@ enum CliError {
     ProfileUnavailable(String),
     Init(String),
     Archive(ArchiveError),
+    Pack(PackError),
     Graph(GraphRenderError),
     InteractiveTerminalRequired,
     InteractiveFormat,
@@ -343,6 +353,7 @@ impl fmt::Display for CliError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::ProfileUnavailable(message) | Self::Init(message) => formatter.write_str(message),
             Self::Archive(error) => write!(formatter, "archive failed: {error}"),
+            Self::Pack(error) => write!(formatter, "pack failed: {error}"),
             Self::Graph(error) => write!(formatter, "graph rendering failed: {error}"),
             Self::InteractiveTerminalRequired => formatter
                 .write_str("interactive graph mode requires both stdin and stdout to be terminals"),
@@ -426,7 +437,12 @@ fn execute(
 ) -> Result<(), CliError> {
     let started = Instant::now();
     match cli.command {
-        Command::Init { directory, target, flat, lib } => {
+        Command::Init {
+            directory,
+            target,
+            flat,
+            lib,
+        } => {
             if cli.root.is_some() {
                 return Err(CliError::Init("--root cannot be used with init".into()));
             }
@@ -467,8 +483,8 @@ fn execute(
             } else {
                 root_file.file_name().map(PathBuf::from).unwrap_or_default()
             };
-            let message = archive_project(&config_dir, &scopes, &root_relative)
-                .map_err(CliError::Archive)?;
+            let message =
+                archive_project(&config_dir, &scopes, &root_relative).map_err(CliError::Archive)?;
             let subject = message.lines().next().unwrap_or(&message);
             logger
                 .finished(
@@ -476,6 +492,38 @@ fn execute(
                     started.elapsed(),
                 )
                 .map_err(CliError::WriteDiagnostics)
+        }
+        Command::Pack { output } => {
+            let root_file = resolve_root_file(cli.root.as_deref(), current_directory)?;
+            let config_dir = config_directory(&root_file);
+            let output = match output {
+                Some(path) => resolve_from(current_directory, &path),
+                None => {
+                    let name = crate::pack::package_name(&root_file);
+                    config_dir.join("dist").join(format!("{name}.mjar"))
+                }
+            };
+            match pack_project(&root_file, &output, |module| logger.parsing(module)) {
+                Ok(summary) => logger
+                    .finished(
+                        &format!(
+                            "packed {} modules into `{}`",
+                            summary.modules(),
+                            summary.output().display()
+                        ),
+                        started.elapsed(),
+                    )
+                    .map_err(CliError::WriteDiagnostics),
+                Err(PackError::Analysis(diagnostics) | PackError::Verification(diagnostics)) => {
+                    for diagnostic in &diagnostics {
+                        logger
+                            .diagnostic(diagnostic)
+                            .map_err(CliError::WriteDiagnostics)?;
+                    }
+                    Err(CliError::AnalysisFailed)
+                }
+                Err(error) => Err(CliError::Pack(error)),
+            }
         }
         Command::Graph {
             target,
@@ -1166,6 +1214,7 @@ fn execute_maintenance(
         | Command::Build { .. }
         | Command::Init { .. }
         | Command::Archive
+        | Command::Pack { .. }
         | Command::Graph { .. } => {
             return Err(CliError::InvalidArguments);
         }
