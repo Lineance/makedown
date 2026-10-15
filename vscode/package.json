@@ -2,7 +2,7 @@
   "name": "makedown",
   "displayName": "Makedown",
   "description": "Edit Markfile specifications and Markdown templates with highlighting, diagnostics, completion, navigation, and formatting.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "Moonhalf383",
   "license": "MIT",
   "repository": {
