@@ -205,8 +205,9 @@ fn changed_paths(output: &[u8]) -> Result<Vec<(u8, PathBuf)>, ArchiveError> {
     if fields.len() % 2 != 0 {
         return Err(ArchiveError::InvalidGitOutput("diff"));
     }
-    fields
-        .chunks_exact(2)
+    let (pairs, _) = fields.as_chunks::<2>();
+    pairs
+        .iter()
         .map(|pair| {
             let status = *pair[0]
                 .first()
